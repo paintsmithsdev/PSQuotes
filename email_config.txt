@@ -1,0 +1,5 @@
+smtp_server=smtp.propaintteams.co.za
+smtp_port=465
+use_ssl=True
+sender_email=info@propaintteams.co.za
+password=77P@int77

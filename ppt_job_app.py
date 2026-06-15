@@ -1,0 +1,2633 @@
+import hashlib
+import json
+import re
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import os
+import smtplib
+import pythoncom
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
+from datetime import date
+from io import BytesIO
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+import db_local as db_sheets
+
+st.set_page_config(page_title="Pro Paint Teams Job/Site Worksheet", layout="wide")
+st.title("Pro Paint Teams Job/Site Worksheet App")
+st.caption("Version 2.7 – Master Rates: paint specs + additionals, edit in form, save to sort & store")
+
+DB_READY = True
+
+# ====================== HELPER FUNCTIONS ======================
+
+def _build_pdf(elements):
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=12*mm,
+        rightMargin=12*mm,
+        topMargin=12*mm,
+        bottomMargin=12*mm
+    )
+    doc.build(elements)
+    return buffer.getvalue()
+
+def _simple_table(data, col_widths):
+    """Improved table – guaranteed A4 fit with proper word wrapping"""
+    styles = getSampleStyleSheet()
+    normal_style = ParagraphStyle(
+        'Normal',
+        parent=styles['Normal'],
+        fontSize=9,
+        leading=11,
+        spaceAfter=2,
+        wordWrap='CJK'
+    )
+    table_data = []
+    for row in data:
+        new_row = [
+            Paragraph(str(cell), normal_style) if isinstance(cell, str) else cell
+            for cell in row
+        ]
+        table_data.append(new_row)
+
+    table = Table(
+        table_data,
+        repeatRows=1,
+        colWidths=col_widths,
+        splitByRow=1
+    )
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    return table
+
+
+def _doc_content_width_inches(doc) -> float:
+    """Printable width between left and right margins (inches)."""
+    section = doc.sections[-1]
+    return (
+        section.page_width.inches
+        - section.left_margin.inches
+        - section.right_margin.inches
+    )
+
+
+def _apply_table_column_widths(table, doc, relative_widths: list, margin_factor: float = 0.98):
+    """Scale relative column weights so the table fits inside page margins."""
+    available = _doc_content_width_inches(doc) * margin_factor
+    total = sum(relative_widths)
+    if total <= 0 or available <= 0:
+        return
+    from docx.shared import Inches
+
+    table.autofit = False
+    scale = available / total
+    for col_idx, rel in enumerate(relative_widths):
+        w = rel * scale
+        for cell in table.columns[col_idx].cells:
+            cell.width = Inches(w)
+
+
+# PDF table column widths (relative numbers; scaled to page by _apply_table_column_widths).
+# Edit the list for each export to change column sizing.
+PDF_COL_WIDTHS_TAB1_QUOTE = [0.70, 0.75, 0.45, 0.70, 0.70, 1.50, 1.25]
+PDF_COL_WIDTHS_TAB3_ATTENDANCE = [1.15] + [0.30] * 31 + [0.50, 0.55]  # Name, days 1–31, Totals, R/value
+# Tab 3 attendance PDF table font (points). Edit here to change PDF table text size.
+ATTENDANCE_PDF_HEADER_PT = 9.0
+ATTENDANCE_PDF_BODY_PT = 8.0
+ATTENDANCE_PDF_SUMMARY_PT = 7.0  # Bottom bonus block (compact for single-page fit)
+
+
+def _force_cell_font_pt(cell, size_pt: float, *, bold: bool = False, center: bool = True):
+    """Set font size on every run in a table cell (OOXML + python-docx for reliable PDF export)."""
+    from docx.shared import Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    half_pts = str(int(round(float(size_pt) * 2)))
+
+    for paragraph in cell.paragraphs:
+        if center:
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        paragraph.paragraph_format.space_before = 0
+        paragraph.paragraph_format.space_after = 0
+        if not paragraph.runs and (paragraph.text or "").strip():
+            paragraph.add_run(paragraph.text)
+        for run in paragraph.runs:
+            run.bold = bold
+            run.font.size = Pt(size_pt)
+            r_pr = run._element.get_or_add_rPr()
+            for tag in ("w:sz", "w:szCs"):
+                el = r_pr.find(qn(tag))
+                if el is None:
+                    el = OxmlElement(tag)
+                    r_pr.append(el)
+                el.set(qn("w:val"), half_pts)
+
+
+def _format_attendance_pdf_table(table, doc):
+    """Landscape layout + compact fonts for Tab 3 attendance grid (34 columns)."""
+    from docx.enum.section import WD_ORIENT
+    from docx.shared import Inches
+
+    for section in doc.sections:
+        if section.page_width < section.page_height:
+            section.page_width, section.page_height = section.page_height, section.page_width
+        section.orientation = WD_ORIENT.LANDSCAPE
+        section.left_margin = Inches(0.3)
+        section.right_margin = Inches(0.3)
+        section.top_margin = Inches(0.4)
+        section.bottom_margin = Inches(0.4)
+
+    for r_idx, row in enumerate(table.rows):
+        size_pt = ATTENDANCE_PDF_HEADER_PT if r_idx == 0 else ATTENDANCE_PDF_BODY_PT
+        for cell in row.cells:
+            _force_cell_font_pt(
+                cell,
+                size_pt,
+                bold=(r_idx == 0),
+                center=True,
+            )
+    _apply_table_column_widths(table, doc, PDF_COL_WIDTHS_TAB3_ATTENDANCE)
+
+
+TAB2_JOB_SPEC_LINE_SPACING = 1.35
+
+
+def _tab2_pdf_set_spacing(paragraph, space_before=0, space_after=6):
+    """Comfortable line spacing for Tab 2 Job Spec PDF body text."""
+    from docx.enum.text import WD_LINE_SPACING
+    from docx.shared import Pt
+
+    pf = paragraph.paragraph_format
+    if space_before:
+        pf.space_before = Pt(space_before)
+    if space_after is not None:
+        pf.space_after = Pt(space_after)
+    pf.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
+    pf.line_spacing = TAB2_JOB_SPEC_LINE_SPACING
+
+
+def _tab2_pdf_table_row_bottom_rule(table, row_idx=0):
+    """Light full-width horizontal rule under a table row."""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    for cell in table.rows[row_idx].cells:
+        tc_pr = cell._tc.get_or_add_tcPr()
+        tc_bdr = tc_pr.find(qn("w:tcBdr"))
+        if tc_bdr is None:
+            tc_bdr = OxmlElement("w:tcBdr")
+            tc_pr.append(tc_bdr)
+        bottom = OxmlElement("w:bottom")
+        bottom.set(qn("w:val"), "single")
+        bottom.set(qn("w:sz"), "6")
+        bottom.set(qn("w:space"), "0")
+        bottom.set(qn("w:color"), "BFBFBF")
+        tc_bdr.append(bottom)
+
+
+def _tab2_pdf_writing_line(doc):
+    """Blank ruled line for handwritten notes on the Job Spec PDF."""
+    p = doc.add_paragraph("_" * 74)
+    _tab2_pdf_set_spacing(p, space_after=10)
+    return p
+
+
+def _tab2_pdf_no_wrap_cell(cell):
+    """Keep each line in a table cell from wrapping onto the next line."""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    tc_pr = cell._tc.get_or_add_tcPr()
+    if tc_pr.find(qn("w:noWrap")) is None:
+        tc_pr.append(OxmlElement("w:noWrap"))
+
+
+def _tab2_pdf_add_right_info_line(cell, label, value, space_after=3):
+    """Right-aligned label/value line for Job Spec PDF info blocks."""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    p = cell.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    p.paragraph_format.keep_together = True
+    _tab2_pdf_set_spacing(p, space_after=space_after)
+    p.add_run(label).bold = True
+    p.add_run(str(value or ""))
+    return p
+
+
+def _set_tab2_area_desc_cell(cell, area_desc: str, job_notes: str):
+    """Area + Interior/Exterior in bold; job notes in normal text on following line(s)."""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    cell.text = ""
+    p = cell.paragraphs[0]
+    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    p.paragraph_format.space_before = 0
+    p.paragraph_format.space_after = 4
+    run = p.add_run(str(area_desc or ""))
+    run.bold = True
+    notes = str(job_notes or "").strip()
+    if notes:
+        p2 = cell.add_paragraph()
+        p2.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        p2.paragraph_format.space_before = 0
+        p2.paragraph_format.space_after = 0
+        p2.add_run(notes)
+
+
+def _render_tab2_job_spec_body(doc, job_no, total_man_days, sections, client_info=None):
+    """Render Tab 2 Job Spec PDF as section blocks (no table), per Quote App template."""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    client_info = client_info or {}
+
+    info_table = doc.add_table(rows=1, cols=2)
+    info_table.alignment = 0
+    info_table.autofit = False
+    left_cell, right_cell = info_table.rows[0].cells[0], info_table.rows[0].cells[1]
+
+    lp = left_cell.paragraphs[0]
+    lp.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    _tab2_pdf_set_spacing(lp, space_after=4)
+    lp_title = lp.add_run("Customer Info")
+    lp_title.bold = True
+    for label, key in (
+        ("Client: ", "client"),
+        ("Phone: ", "phone"),
+        ("Email: ", "email"),
+        ("Address: ", "address"),
+    ):
+        p = left_cell.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        _tab2_pdf_set_spacing(p, space_after=3)
+        p.add_run(label).bold = True
+        p.add_run(str(client_info.get(key, "") or ""))
+
+    rp = right_cell.paragraphs[0]
+    rp.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    rp.paragraph_format.keep_together = True
+    _tab2_pdf_set_spacing(rp, space_after=4)
+    rp_title = rp.add_run("Area Manager Info")
+    rp_title.bold = True
+    _tab2_pdf_add_right_info_line(
+        right_cell, "Area Manager: ", client_info.get("area_manager", ""), space_after=3
+    )
+    _tab2_pdf_add_right_info_line(
+        right_cell, "Phone: ", client_info.get("am_phone", ""), space_after=3
+    )
+    _tab2_pdf_add_right_info_line(
+        right_cell, "Email: ", client_info.get("am_email", ""), space_after=0
+    )
+    _tab2_pdf_no_wrap_cell(right_cell)
+
+    _apply_table_column_widths(info_table, doc, [1.0, 1.0], margin_factor=0.98)
+
+    info_spacer = doc.add_paragraph("")
+    _tab2_pdf_set_spacing(info_spacer, space_after=12)
+
+    hdr_table = doc.add_table(rows=1, cols=2)
+    hdr_table.alignment = 0
+    hdr_table.autofit = False
+    hdr_left, hdr_right = hdr_table.rows[0].cells[0], hdr_table.rows[0].cells[1]
+
+    hp_left = hdr_left.paragraphs[0]
+    hp_left.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    _tab2_pdf_set_spacing(hp_left, space_after=8)
+    hp_left.add_run("Quote Number: ").bold = True
+    hp_left.add_run(str(job_no or ""))
+
+    hp_right = hdr_right.paragraphs[0]
+    hp_right.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    _tab2_pdf_set_spacing(hp_right, space_after=8)
+    hp_right.add_run("Total Allowed Man-days: ").bold = True
+    hp_right.add_run(f"{float(total_man_days or 0):.2f}")
+
+    _apply_table_column_widths(hdr_table, doc, [1.0, 1.0], margin_factor=0.98)
+    _tab2_pdf_table_row_bottom_rule(hdr_table)
+
+    hdr_spacer = doc.add_paragraph("")
+    _tab2_pdf_set_spacing(hdr_spacer, space_after=14)
+
+    for sec in sections or []:
+        p_title = doc.add_paragraph()
+        _tab2_pdf_set_spacing(p_title, space_before=12, space_after=6)
+        title_run = p_title.add_run(str(sec.get("title", "")))
+        title_run.bold = True
+
+        p_qty = doc.add_paragraph()
+        _tab2_pdf_set_spacing(p_qty, space_after=8)
+        qty_label = p_qty.add_run("Qty: ")
+        qty_label.bold = True
+        p_qty.add_run(str(sec.get("qty_line", "")))
+
+        p_jn = doc.add_paragraph()
+        _tab2_pdf_set_spacing(p_jn, space_after=4)
+        jn_label = p_jn.add_run("Job Notes(steps)")
+        jn_label.bold = True
+
+        steps = sec.get("job_note_steps") or []
+        if not steps:
+            for n in range(1, 4):
+                p_step = doc.add_paragraph(f"{n}. .")
+                _tab2_pdf_set_spacing(p_step, space_after=5)
+        else:
+            for n, step in enumerate(steps, 1):
+                p_step = doc.add_paragraph(f"{n}. {step}")
+                _tab2_pdf_set_spacing(p_step, space_after=5)
+
+        p_notes = doc.add_paragraph()
+        _tab2_pdf_set_spacing(p_notes, space_before=10, space_after=6)
+        notes_label = p_notes.add_run("Notes:")
+        notes_label.bold = True
+        notes_text = str(sec.get("notes", "") or "").strip()
+        if notes_text:
+            p_prefill = doc.add_paragraph(notes_text)
+            _tab2_pdf_set_spacing(p_prefill, space_after=6)
+        for _ in range(3):
+            _tab2_pdf_writing_line(doc)
+
+        p_chk = doc.add_paragraph()
+        _tab2_pdf_set_spacing(p_chk, space_before=12, space_after=6)
+        chk_label = p_chk.add_run("Completed & Checked:")
+        chk_label.bold = True
+        p_sig = doc.add_paragraph(
+            " Name__________________________             Signed___________________________"
+        )
+        _tab2_pdf_set_spacing(p_sig, space_after=0)
+
+        spacer = doc.add_paragraph("")
+        _tab2_pdf_set_spacing(spacer, space_after=18)
+
+
+# ====================== WORD COM: DOCX -> PDF ======================
+def _convert_docx_to_pdf(docx_path: str, pdf_path: str) -> None:
+    """Convert .docx to PDF using Word COM (ExportAsFixedFormat, then SaveAs fallback)."""
+    from win32com.client import DispatchEx
+
+    docx_abs = os.path.abspath(docx_path)
+    pdf_abs = os.path.abspath(pdf_path)
+    word = None
+    docx_obj = None
+    try:
+        word = DispatchEx("Word.Application")
+        word.Visible = False
+        word.DisplayAlerts = 0
+        docx_obj = word.Documents.Open(docx_abs, ReadOnly=True)
+        try:
+            docx_obj.ExportAsFixedFormat(
+                OutputFileName=pdf_abs,
+                ExportFormat=17,
+            )
+        except Exception:
+            docx_obj.SaveAs(pdf_abs, FileFormat=17)
+    finally:
+        if docx_obj is not None:
+            try:
+                docx_obj.Close(False)
+            except Exception:
+                pass
+        if word is not None:
+            try:
+                word.Quit()
+            except Exception:
+                pass
+
+    if not os.path.exists(pdf_abs) or os.path.getsize(pdf_abs) == 0:
+        raise RuntimeError(
+            "Word did not produce a PDF. Check that Microsoft Word is installed "
+            "and not blocked by another open document."
+        )
+
+
+# ====================== FINAL PDF-ONLY HELPER - NO XML CODE ======================
+def generate_letterhead_pdf(
+    tab_title: str,
+    job_no: str,
+    client: str = "",
+    content_lines: list = None,
+    content_pairs: list = None,
+    table_rows: list = None,
+    client_info: dict = None,
+    force_portrait: bool = False,
+    attendance_meta: dict = None,
+    template_candidates: list = None,
+    attendance_table: bool = False,
+    job_spec_sections: list = None,
+    total_man_days: float = None,
+):
+    """Builds .docx with Letterhead + visible table (using only safe high-level code), then converts to PDF using Word COM."""
+    try:
+        from docx import Document
+        import tempfile
+        import os
+        import pythoncom
+        from docx.enum.section import WD_ORIENT
+        from docx.shared import Pt, Inches
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+
+        def _force_table_borders(docx_table):
+            """Apply explicit borders so PDF export always shows grid lines."""
+            tbl = docx_table._tbl
+            tbl_pr = tbl.tblPr
+            tbl_borders = tbl_pr.find(qn("w:tblBorders"))
+            if tbl_borders is None:
+                tbl_borders = OxmlElement("w:tblBorders")
+                tbl_pr.append(tbl_borders)
+
+            for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+                edge_tag = qn(f"w:{edge}")
+                edge_el = tbl_borders.find(edge_tag)
+                if edge_el is None:
+                    edge_el = OxmlElement(f"w:{edge}")
+                    tbl_borders.append(edge_el)
+                edge_el.set(qn("w:val"), "single")
+                edge_el.set(qn("w:sz"), "10")      # 10/8 pt line weight
+                edge_el.set(qn("w:space"), "0")
+                edge_el.set(qn("w:color"), "000000")
+
+        def _shade_cell(cell, fill="D9D9D9"):
+            """Apply grey shading to a cell."""
+            tc_pr = cell._tc.get_or_add_tcPr()
+            shd = tc_pr.find(qn("w:shd"))
+            if shd is None:
+                shd = OxmlElement("w:shd")
+                tc_pr.append(shd)
+            shd.set(qn("w:val"), "clear")
+            shd.set(qn("w:color"), "auto")
+            shd.set(qn("w:fill"), fill)
+
+        pythoncom.CoInitialize()
+
+        letterhead_path = None
+        docx_candidates = template_candidates or [
+            "letterhead.docx",
+            "Letterhead.docx",
+            "template.docx",
+            "Template.docx",
+        ]
+        for candidate in docx_candidates:
+            if os.path.exists(candidate):
+                letterhead_path = candidate
+                break
+        if not letterhead_path:
+            st.error("❌ No template .docx found in app folder.")
+            return None
+
+        doc = Document(letterhead_path)
+
+        if force_portrait:
+            for section in doc.sections:
+                # Ensure the exported PDF uses portrait orientation for this document.
+                if section.page_width > section.page_height:
+                    section.page_width, section.page_height = section.page_height, section.page_width
+                section.orientation = WD_ORIENT.PORTRAIT
+
+        # Remove trailing empty paragraphs from template so title sits directly under letterhead.
+        while doc.paragraphs and not doc.paragraphs[-1].text.strip():
+            p = doc.paragraphs[-1]._element
+            p.getparent().remove(p)
+
+        heading = doc.add_heading(tab_title, level=1)
+        heading.paragraph_format.space_before = 0
+        heading.paragraph_format.space_after = 4 if attendance_meta else 6
+
+        # Attendance header: client info (left) + completed date & signature (right).
+        if attendance_meta:
+            info_table = doc.add_table(rows=1, cols=2)
+            info_table.alignment = 0
+            info_table.autofit = False
+            left_cell, right_cell = info_table.rows[0].cells[0], info_table.rows[0].cells[1]
+
+            lp = left_cell.paragraphs[0]
+            lp.paragraph_format.space_after = 2
+            lp.add_run("Client: ").bold = True
+            lp.add_run(str(attendance_meta.get("client", "") or ""))
+            lp2 = left_cell.add_paragraph()
+            lp2.paragraph_format.space_after = 2
+            lp2.add_run("Job: ").bold = True
+            lp2.add_run(str(attendance_meta.get("job_no", "") or ""))
+            lp3 = left_cell.add_paragraph()
+            lp3.paragraph_format.space_after = 0
+            lp3.add_run("Address: ").bold = True
+            lp3.add_run(str(attendance_meta.get("address", "") or ""))
+
+            rp = right_cell.paragraphs[0]
+            rp.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            rp.paragraph_format.space_after = 4
+            rp.add_run("Completed Date: ").bold = True
+            rp2 = right_cell.add_paragraph()
+            rp2.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            rp2.paragraph_format.space_after = 0
+            rp2.add_run("Signature: ").bold = True
+            rp2.add_run(str(attendance_meta.get("signature", "") or ""))
+
+            # 50/50 columns: client left half; date/signature labels left-aligned from page centre.
+            _apply_table_column_widths(info_table, doc, [1.0, 1.0], margin_factor=0.98)
+            _force_table_borders(info_table)
+            spacer = doc.add_paragraph("")
+            spacer.paragraph_format.space_before = 0
+            spacer.paragraph_format.space_after = 2
+
+        # Tab 2 Job Spec: section blocks (no table) per Quote App template.
+        if job_spec_sections is not None:
+            _render_tab2_job_spec_body(
+                doc,
+                job_no,
+                total_man_days,
+                job_spec_sections,
+                {
+                    "client": client,
+                    "phone": (client_info or {}).get("phone", ""),
+                    "email": (client_info or {}).get("email", ""),
+                    "address": (client_info or {}).get("address", ""),
+                    "area_manager": (client_info or {}).get("area_manager", ""),
+                    "am_phone": (client_info or {}).get("am_phone", ""),
+                    "am_email": (client_info or {}).get("am_email", ""),
+                },
+            )
+
+        # Optional generic client info block (used where required).
+        elif client_info:
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            p.add_run(f"Job Number: {job_no}").bold = True
+
+            p2 = doc.add_paragraph()
+            p2.add_run("Client: ").bold = True
+            p2.add_run(str(client or ""))
+            p2.add_run("      ")
+            p2.add_run("Phone: ").bold = True
+            p2.add_run(str(client_info.get("phone", "") or ""))
+            p2.add_run("      ")
+            p2.add_run("Email: ").bold = True
+            p2.add_run(str(client_info.get("email", "") or ""))
+
+            p3 = doc.add_paragraph()
+            p3.add_run("Address: ").bold = True
+            p3.add_run(str(client_info.get("address", "") or ""))
+
+            p4 = doc.add_paragraph()
+            p4.add_run("Area Manager: ").bold = True
+            p4.add_run(str(client_info.get("area_manager", "") or ""))
+
+        # Generic body lines for sections that are text based.
+        for line in (content_lines or []):
+            if str(line).strip():
+                doc.add_paragraph(str(line))
+
+        # Optional paired label/value rows (two label groups on one line).
+        for pair_row in (content_pairs or []):
+            if not pair_row:
+                continue
+            label1, value1, label2, value2 = pair_row
+            p = doc.add_paragraph()
+            if str(label1).strip():
+                p.add_run(str(label1)).bold = True
+            p.add_run(str(value1))
+            if str(label2).strip():
+                p.add_run("      ")
+                p.add_run(str(label2)).bold = True
+                p.add_run(str(value2))
+
+        # Create table
+        if table_rows:
+            table = doc.add_table(rows=1, cols=len(table_rows[0]))
+            table.alignment = 0  # Left-align table on page.
+
+            # Header
+            hdr_cells = table.rows[0].cells
+            for i, heading in enumerate(table_rows[0]):
+                hdr_cells[i].text = str(heading)
+                for paragraph in hdr_cells[i].paragraphs:
+                    paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    paragraph.paragraph_format.space_before = 0
+                    paragraph.paragraph_format.space_after = 0
+                    for run in paragraph.runs:
+                        run.bold = True
+                _shade_cell(hdr_cells[i], "D9D9D9")
+
+            # Data rows
+            for row_data in table_rows[1:]:
+                row_cells = table.add_row().cells
+                for i, cell_text in enumerate(row_data):
+                    if (
+                        i == 1
+                        and isinstance(cell_text, (tuple, list))
+                        and len(cell_text) >= 2
+                    ):
+                        _set_tab2_area_desc_cell(
+                            row_cells[i], cell_text[0], cell_text[1]
+                        )
+                    else:
+                        row_cells[i].text = str(cell_text)
+                    for paragraph in row_cells[i].paragraphs:
+                        paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                        paragraph.paragraph_format.space_before = 0
+                        paragraph.paragraph_format.space_after = 0
+
+            headers = [str(h).strip().lower().rstrip(":") for h in table_rows[0]]
+            is_attendance = attendance_table or (
+                len(headers) >= 34
+                and any(h.startswith("name") for h in headers)
+                and "1" in headers
+                and "31" in headers
+                and any(h.startswith("total") for h in headers)
+            )
+
+            # Table Grid style can reset cell fonts when Word exports to PDF.
+            if not is_attendance:
+                try:
+                    table.style = 'Table Grid'
+                except Exception:
+                    try:
+                        table.style = 'Light Grid'
+                    except Exception:
+                        try:
+                            table.style = 'Grid Table 1 Light'
+                        except Exception:
+                            pass
+
+            if "notes" in headers and "job note" in headers and len(headers) == 7:
+                _apply_table_column_widths(table, doc, PDF_COL_WIDTHS_TAB1_QUOTE)
+            elif is_attendance:
+                _format_attendance_pdf_table(table, doc)
+
+            # Ensure visible borders regardless of Letterhead template styles.
+            _force_table_borders(table)
+
+            # Attendance summary block under the table.
+            if attendance_meta:
+                man_days_allowed = float(
+                    attendance_meta.get("man_days_allowed", attendance_meta.get("man_days_available", 0)) or 0
+                )
+
+                sum_spacer = doc.add_paragraph("")
+                sum_spacer.paragraph_format.space_before = 0
+                sum_spacer.paragraph_format.space_after = 0
+                summary_table = doc.add_table(rows=5, cols=2)
+                summary_table.alignment = 0
+                summary_table.autofit = False
+
+                labels = [
+                    "Man Days Allowed",
+                    "Man Days Total",
+                    "Bonus Man Days",
+                    "R value of Bonus",
+                    "Bonus per Man Day",
+                ]
+                values = [
+                    f"{man_days_allowed:.1f}",
+                    "",
+                    "",
+                    "",
+                    "",
+                ]
+
+                for idx in range(5):
+                    left = summary_table.rows[idx].cells[0]
+                    right = summary_table.rows[idx].cells[1]
+                    left.text = labels[idx]
+                    right.text = values[idx]
+                    for cell in (left, right):
+                        for paragraph in cell.paragraphs:
+                            paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                            paragraph.paragraph_format.space_before = 0
+                            paragraph.paragraph_format.space_after = 0
+                    _force_cell_font_pt(
+                        left, ATTENDANCE_PDF_SUMMARY_PT, bold=True, center=False
+                    )
+                    _force_cell_font_pt(
+                        right, ATTENDANCE_PDF_SUMMARY_PT, bold=False, center=False
+                    )
+
+                _apply_table_column_widths(summary_table, doc, [2.0, 1.0], margin_factor=0.55)
+                _force_table_borders(summary_table)
+
+        # Save temp .docx
+        with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp_docx:
+            tmp_path = tmp_docx.name
+        doc.save(tmp_path)
+
+        tmp_pdf_path = tmp_path.replace(".docx", ".pdf")
+        _convert_docx_to_pdf(tmp_path, tmp_pdf_path)
+
+        # Read PDF
+        with open(tmp_pdf_path, "rb") as f:
+            pdf_buffer = BytesIO(f.read())
+
+        # Cleanup
+        os.unlink(tmp_path)
+        if os.path.exists(tmp_pdf_path):
+            os.unlink(tmp_pdf_path)
+
+        pythoncom.CoUninitialize()
+        return pdf_buffer
+
+    except Exception as e:
+        st.error(f"PDF generation error: {e}")
+        try:
+            pythoncom.CoUninitialize()
+        except:
+            pass
+        return None
+
+# Cached loaders
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_clients(): return db_sheets.get_all_clients()
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_jobs(): return db_sheets.get_all_jobs()
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_quote_areas(job_no=None): return db_sheets.get_quote_areas(job_no)
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_attendance(job_no=None): return db_sheets.get_attendance(job_no)
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_bonus_log(): return db_sheets.get_bonus_log()
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_job_history(): return db_sheets.get_job_history()
+
+def _clear_cloud_cache():
+    _cached_clients.clear()
+    _cached_jobs.clear()
+    _cached_quote_areas.clear()
+    _cached_attendance.clear()
+    _cached_bonus_log.clear()
+    _cached_job_history.clear()
+
+def _sort_master_rates_df(df):
+    """Ensure # column exists, fill gaps, and sort rows by # (dropdown order)."""
+    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+        return df
+    df = df.copy().reset_index(drop=True)
+    if "#" not in df.columns:
+        df.insert(0, "#", range(1, len(df) + 1))
+    df["#"] = pd.to_numeric(df["#"], errors="coerce")
+    missing = df["#"].isna()
+    if missing.any():
+        max_n = df.loc[~missing, "#"].max()
+        max_n = int(max_n) if pd.notna(max_n) else 0
+        df.loc[missing, "#"] = list(range(max_n + 1, max_n + 1 + int(missing.sum())))
+    df["#"] = df["#"].astype(int)
+    return df.sort_values("#", kind="stable").reset_index(drop=True)
+
+
+def _df_to_rate_dicts(df):
+    new_rates, new_units, new_notes = {}, {}, {}
+    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+        return new_rates, new_units, new_notes
+    if isinstance(df, pd.DataFrame):
+        df = _sort_master_rates_df(df)
+    for _, row in df.iterrows():
+        item = str(row.get("Item", "")).strip()
+        if not item:
+            continue
+        material = float(row["Material (R/unit)"]) if pd.notna(row.get("Material (R/unit)")) else 0.0
+        labour = float(row["Labour (R/unit)"]) if pd.notna(row.get("Labour (R/unit)")) else 0.0
+        new_rates[item] = {"material": material, "labour": labour}
+        new_units[item] = row.get("Unit", "m²")
+        new_notes[item] = str(row.get("Default Job Notes", "") or "")
+    return new_rates, new_units, new_notes
+
+
+def _update_session_rates_from_df(df=None):
+    """Populate ITEM_RATES, ITEM_UNITS, DEFAULT_JOB_NOTES from the master rates DataFrame."""
+    if df is None:
+        df = st.session_state.get("master_rates_df") or st.session_state.get("item_rates_df")
+    _mr, _mu, _mn = _df_to_rate_dicts(df)
+    st.session_state.ITEM_RATES = _mr
+    st.session_state.ITEM_UNITS = _mu
+    st.session_state.DEFAULT_JOB_NOTES = _mn
+
+
+def _clear_streamlit_widget_key(key: str):
+    """Drop a widget key so the next run rebuilds it from session data (after save/cancel)."""
+    if key in st.session_state:
+        del st.session_state[key]
+
+
+def _apply_tab2_editor_edits(base_df, edited_show, area_only, job_notes_col):
+    """Merge data_editor output into tab2_spec_df without wiping in-progress cells."""
+    out = base_df.copy()
+    n = min(len(out), len(edited_show))
+    for col in ("Unit", "Quantity", "Notes"):
+        if col in edited_show.columns and col in out.columns and n > 0:
+            out.loc[out.index[:n], col] = edited_show.iloc[:n][col].values
+    if len(edited_show) > len(out):
+        extra = edited_show.iloc[len(out):].copy()
+        for col in ("Area Description", "Job Notes"):
+            if col not in extra.columns:
+                extra[col] = ""
+        if "Section" in out.columns:
+            start = len(out) + 1
+            extra["Section"] = [str(start + i) for i in range(len(extra))]
+        out = pd.concat([out, extra.reindex(columns=out.columns, fill_value="")], ignore_index=True)
+    elif len(edited_show) < len(out):
+        out = out.iloc[: len(edited_show)].copy()
+    if "Area Description" in out.columns and len(area_only) == len(out):
+        out["Area Description"] = area_only.values[: len(out)]
+    if "Job Notes" in out.columns and len(job_notes_col) == len(out):
+        out["Job Notes"] = job_notes_col.values[: len(out)]
+    return out
+
+
+def _load_master_rates_dataframe():
+    """Load master rates from DB, or built-in defaults when nothing is saved yet."""
+    loaded = db_sheets.load_custom_rates()
+    if len(loaded) == 4:
+        custom_rates, custom_units, custom_notes, sort_orders = loaded
+    else:
+        custom_rates, custom_units, custom_notes = loaded
+        sort_orders = {}
+    if custom_rates:
+        data = [
+            {
+                "#": sort_orders.get(item) or (i + 1),
+                "Item": item,
+                "Unit": custom_units.get(item, "m²"),
+                "Material (R/unit)": custom_rates[item]["material"],
+                "Labour (R/unit)": custom_rates[item]["labour"],
+                "Default Job Notes": custom_notes.get(item, ""),
+            }
+            for i, item in enumerate(custom_rates)
+        ]
+        return pd.DataFrame(data)
+    return pd.DataFrame(DEFAULT_MASTER_RATES)
+
+
+def _normalize_master_rates_df(df=None):
+    """Normalize dtypes and # values without re-sorting (keeps data_editor row indices stable)."""
+    if df is None:
+        df = _load_master_rates_dataframe()
+    cols = ["#", "Item", "Unit", "Material (R/unit)", "Labour (R/unit)", "Default Job Notes"]
+    df = df.copy().reset_index(drop=True)
+    for col in cols:
+        if col not in df.columns:
+            if col == "#":
+                df[col] = range(1, len(df) + 1)
+            else:
+                df[col] = "" if col in ("Item", "Unit", "Default Job Notes") else 0.0
+    df = df[cols]
+    df["Item"] = df["Item"].fillna("").astype(str)
+    df["Unit"] = df["Unit"].fillna("m²").astype(str)
+    df["Default Job Notes"] = df["Default Job Notes"].fillna("").astype(str)
+    df["Material (R/unit)"] = pd.to_numeric(df["Material (R/unit)"], errors="coerce").fillna(0.0)
+    df["Labour (R/unit)"] = pd.to_numeric(df["Labour (R/unit)"], errors="coerce").fillna(0.0)
+    if "#" not in df.columns:
+        df.insert(0, "#", range(1, len(df) + 1))
+    df["#"] = pd.to_numeric(df["#"], errors="coerce")
+    missing = df["#"].isna()
+    if missing.any():
+        max_n = df.loc[~missing, "#"].max()
+        max_n = int(max_n) if pd.notna(max_n) else 0
+        df.loc[missing, "#"] = list(range(max_n + 1, max_n + 1 + int(missing.sum())))
+    df["#"] = df["#"].astype(int)
+    return df
+
+
+def _prepare_master_rates_df(df=None):
+    """Normalize dtypes/index and sort by # (for load/save, not during live cell edits)."""
+    return _sort_master_rates_df(_normalize_master_rates_df(df))
+
+
+_MASTER_RATES_EDITOR_KEY = "master_rates_editor"
+
+
+# Default master rates when nothing is saved in the database yet
+DEFAULT_MASTER_RATES = [
+    {"Item": "Aluminium Restore", "Unit": "each", "Material (R/unit)": 11, "Labour (R/unit)": 35,
+     "Default Job Notes": "•	Remove all loose contaminents with a soft bristle brush\n•	Spray Aluminium Cleaner, let soak for 5 to 10min and wipe off\n•	Apply Alu Revivie to a soft fibre cloth and apply in circular motion till dry\n•	Add coates of Alu revive till desired finish is achieved"},
+    {"Item": "Ceiling/Soffits", "Unit": "m²", "Material (R/unit)": 47, "Labour (R/unit)": 55,
+     "Default Job Notes": "•	Wash ceilings where necessary.\n•	Remove all dust, cobwebs or loose contamination with soft bristle brush.\n•	Caulk ceilings to cornice or wall.\n•	For skimmed ceilings, prime with Midas Plaster Primer.\n•	Apply 2coats of Midafelt 225 (colour to be specified)"},
+    {"Item": "Cornices", "Unit": "lm", "Material (R/unit)": 35, "Labour (R/unit)": 35,
+     "Default Job Notes": "•	Remove loose contaminents and wash with Midas Degreaser where neccesary\n•	Allow to fully dry, then sand lightly to remove gloss and get a uniform finish.\n•	Caulk cornice where neccesary\n•	Apply 1 coat of Universal Undercoat\n•	Allow 4 hours for overcoating\n•	Apply 2 coats of Midafelt 225 OR 2 coats of Waterbased Non-drip Enamel (colour to be specified)"},
+    {"Item": "Crack Repairs", "Unit": "m²", "Material (R/unit)": 30, "Labour (R/unit)": 45,
+     "Default Job Notes": "•	Rake out all cracks wider than 0.5mm (not hairline cracks)\n•	Prime with waterproofing slurry kit OR PCT36\n•	Build up cracks with REPAIR MIX\n•	Smoothen or use a sponge to match existing texture\n•	Open all expansion joints and seal with All Round Sealer"},
+    {"Item": "Cup Grind- Floor Prep", "Unit": "m²", "Material (R/unit)": 30, "Labour (R/unit)": 45,
+     "Default Job Notes": "Note to Client: Cup grinding is a noisy and dusty process. We recommend to remove all items from the room. We aim to complete the work in the prescribed time.\n•	Throuogly sweep floor to remove loose conatminents.\n•	Vaccuum floor to remove all dust and finer contaminents.\n•	Pass the cup-grinder once over the area to achieve a level uniform top.\n•	The objective is to remove the top layer of concrete to create a key coat for the following steps."},
+    {"Item": "Cup Grind- To finish with clear sealer", "Unit": "m²", "Material (R/unit)": 75, "Labour (R/unit)": 90,
+     "Default Job Notes": "Note to Client: Cup grinding is a noisy and dusty process. We recommend to remove all items from the room. We aim to complete the work in the prescribed time.\n•	Throuogly sweep floor to remove loose conatminents.\n•	Vaccuum floor to remove all dust and finer contaminents.\n•	Pass the cup-grinder once over the area to remove high spots\n•	Sweep and vacuum floor to remove all dust\n•	Using a straight edge, look for high spots and mark with chalk\n•	Pass over with the cup-grinder for a second time to cut a smooth uniform finish. \n•	The objective is to grind down the top to a smooth, flat surface, which can be cleaned and sealed."},
+    {"Item": "Exterior Walls Paintwork", "Unit": "m²", "Material (R/unit)": 35, "Labour (R/unit)": 35,
+     "Default Job Notes": "•	Preperation work quoted separately\n•	Remove all loose contaminents and let dry after Pressure Wash.\n•	Allow any repair work to fully dry\n•	Sand lightly and remove dust\n•	Spot prime repairs with Masonry Primer. On new build Prime entire wall with Masonry Primer\n•	Apply 2 coats of Midalux 240 (colour to be specified)"},
+    {"Item": "Facias/Gutters", "Unit": "lm", "Material (R/unit)": 30, "Labour (R/unit)": 25,
+     "Default Job Notes": "•	Ensure surfaces are clean inside and out.\n•	Seal leaks and joints using All Round Sealer, use Peel and Seel for larger gaps\n•	Apply 1 coat of Universal Primer\n•	Apply 2 coats of Midalux 240 (colour to be secified)"},
+    {"Item": "High Pressure Washing", "Unit": "each", "Material (R/unit)": 980, "Labour (R/unit)": 700,
+     "Default Job Notes": "NOTE TO CLIENT: This is a noisy process and can be messy. This should not take more than the indicted days and will be cleaned up. Please point out water sources to be used to the Team Leader upon commencment of work.\n•	High pressure wash min pressure 200 bar  \n•	Wash to remove all salt and dirt + Loose material from area. \n•	When working on the roof use safety harness and anchor point for safety. \n•	Use drop sheet and garbage bags to collect all loose material generated. \n•	Perform cleanup of the area before commencing to with next step"},
+    {"Item": "Interior Skimming", "Unit": "m²", "Material (R/unit)": 75, "Labour (R/unit)": 90,
+     "Default Job Notes": "•	Complete repairs first\n•	Allow fillers and repairs to dry\n•	Use a steel trowel and Interior Skimfill to achieve smooth uniform surface\n•	Sand lightly and wipe down before continuing to prime and paint"},
+    {"Item": "Interior Walls Paintwork", "Unit": "m²", "Material (R/unit)": 35, "Labour (R/unit)": 35,
+     "Default Job Notes": "•	If not skimmed/repaired wash walls with Sugar Soap where contaminated\n•	Let repairs/wash completely dry\n•	Sand repairs and spot prime with Plaster Primer. On new builds prime entire wall with Plaster Primer\n•	Apply two coats of Midafelt 230 (Colour to be specified)"},
+    {"Item": "Mould and Fungi Treatment", "Unit": "m²", "Material (R/unit)": 12, "Labour (R/unit)": 35,
+     "Default Job Notes": "•	Apply 1 coat Midas FUNGICIDAL WASH to all affected areas.\n•	Allow minimum 24 hours reaction time.\n•	Remove all growth with a stiff fibre brush.\n•	Apply SECOND coat of FUNGICIDAL WASH.\n•	DO NOT rinse off the second coat.\n•	Failure to follow this sequence risks regrowth."},
+    {"Item": "Paint Galvanised Metal", "Unit": "m²", "Material (R/unit)": 125, "Labour (R/unit)": 45,
+     "Default Job Notes": "•	Lightly sand surface to dull uniform appearance\n•	Apply 1 coat of 504 Surface Tolerant Epoxy as Primer\n•	Allow 6 to 12 hours (weather depending) to dry before overcoating\n•	Apply 1 coat of 504 Surface Tolerant Epoxy\n•	Allow to Allow 6 to 12 hours (weather depending) to dry before overcoating\n•	Apply 2 coats of 112 Solvent Based Acrithane Sealer"},
+    {"Item": "Paint Metal", "Unit": "m²", "Material (R/unit)": 75, "Labour (R/unit)": 55,
+     "Default Job Notes": "•	Clean metal with Midas Degreaser\n•	Lighlty sand metal to dull uniform surface\n•	Add caulk to frame and wall gaps\n•	Apply 1 coat Metaletch Primer\n•	Apply 1 coat Midaflow Gloss or Midas Masterroof (colour to be specified)"},
+    {"Item": "Paint Metal- Windows/Doors", "Unit": "each", "Material (R/unit)": 185, "Labour (R/unit)": 275,
+     "Default Job Notes": "•	Clean metal with Midas Degreaser\n•	Lighlty sand metal to dull uniform surface\n•	Add caulk to frame and wall gaps\n•	Apply 1 coat Metaletch Primer\n•	Apply 1 coat Midaflow Gloss or Midas Masterroof (colour to be specified)"},
+    {"Item": "Paint Wood", "Unit": "m²", "Material (R/unit)": 60, "Labour (R/unit)": 45,
+     "Default Job Notes": "•	If bare/ new wood present, apply Midas Woodprime to all new surfaces\n•	Lightly sand to uniform colour/appearance\n•	Add caulk to frame and wall gaps\n•	Replace cracking/dry or missing putty. Use Putty Hardener\n•	Spot prime nails, screws or metal fittings with Metal Etch Primer\n•	Apply 1 coat of Universal Undercoat\n•	Apply 2 coat of Midalux 240 OR 2 coats of Water Based Non-Drip Enamel (colour to be specified)"},
+    {"Item": "Paint Wood- Windows/Doors", "Unit": "each", "Material (R/unit)": 150, "Labour (R/unit)": 225,
+     "Default Job Notes": "•	If bare/ new wood present, apply Midas Woodprime to all new surfaces\n•	Lightly sand to uniform colour/appearance\n•	Add caulk to frame and wall gaps\n•	Replace cracking/dry or missing putty. Use Putty Hardener\n•	Spot prime nails, screws or metal fittings with Metal Etch Primer\n•	Apply 1 coat of Universal Undercoat\n•	Apply 2 coat of Midalux 240 OR 2 coats of Midaflow (ext) WB Non-Drip (int) (colour to be specified)"},
+    {"Item": "Plaster Repair", "Unit": "m²", "Material (R/unit)": 80, "Labour (R/unit)": 50,
+     "Default Job Notes": "•	Remove ALL loose, defective and damaged plaster\n•	Prime area with 1 coat bonding liquid\n•	Repair with Paintsmiths PLASTER REPAIR KIT\n•	Do not exceed 20mm thickness.\n•	Do not rush curing – insufficient curing leads to failure\n•	Wet plaster 2 times daily or cover with dropsheet after first wetting.\n•	Smoothen plaster or use a sponge to match existing texture."},
+    {"Item": "Roof Painting", "Unit": "m²", "Material (R/unit)": 55, "Labour (R/unit)": 65,
+     "Default Job Notes": "•	Ensure roof is dry and clean. Do not paint in high humidity, temperature or probability of mist/rain.\n•	Spot prime nails, roof screws and metal fittings with Rust Neutrelizer and Metal Etch Primer.\n•	If needed apply 1 coat of Primer\n•	Apply 2 coats of Midas Masteroof OR Rubberduck (colour to be specified)"},
+    {"Item": "Skimming", "Unit": "m²", "Material (R/unit)": 75, "Labour (R/unit)": 90,
+     "Default Job Notes": "•	Complete repairs first\n•	Allow fillers and repairs to dry\n•	Use a steel trowel and Exterior OR Interior Skimfill to achieve smooth uniform surface\n•	Sand lightly and wipe down before continuing to prime and paint"},
+    {"Item": "Skirtings", "Unit": "lm", "Material (R/unit)": 45, "Labour (R/unit)": 35,
+     "Default Job Notes": "•	Remove loose contaminents and wash with Midas Degreaser where neccesary\n•	Allow to fully dry, then sand lightly to remove gloss and get a uniform finish.\n•	Caulk skirting where neccesary\n•	Apply 1 coat of Universal Undercoat\n•	Allow 4 hours for overcoating\n•	Apply 2 coats of Midafelt 225 OR 2 coats of Waterbased Non-drip Enamel (colour to be specified)"},
+    {"Item": "Tile Remove", "Unit": "m²", "Material (R/unit)": 750, "Labour (R/unit)": 350,
+     "Default Job Notes": "•	Skip Rental\n•	Work following tile removal is a provisional part of the quote- Dependant on substrate condition the quote will have to be reassessed."},
+    {"Item": "Timber Preserve", "Unit": "m²", "Material (R/unit)": 70, "Labour (R/unit)": 45,
+     "Default Job Notes": "•	Lightly sand to uniform colour/appearance\n•	Add caulk to frame and wall gaps\n•	Replace cracking/dry or missing putty. Use Putty Hardener\n•	Apply 1 coat of Timber Preserve**\n•	Lighlty sand and apply second coat of Timber Preserve**\n**Please note drying time is 48hrs +"},
+    {"Item": "Timber Preserve- Windows/Doors", "Unit": "each", "Material (R/unit)": 125, "Labour (R/unit)": 175,
+     "Default Job Notes": "•	Lightly sand to uniform colour/appearance\n•	Add caulk to frame and wall gaps\n•	Replace cracking/dry or missing putty. Use Putty Hardener\n•	Apply 1 coat of Timber Preserve**\n•	Lighlty sand and apply second coat of Timber Preserve**\n**Please note drying time is 48hrs +"},
+    {"Item": "Varnish Wood", "Unit": "m²", "Material (R/unit)": 51, "Labour (R/unit)": 97,
+     "Default Job Notes": "•	Lightly sand to uniform colour/appearance\n•	Add caulk to frame and wall gaps\n•	Replace cracking/dry or missing putty. Use Putty Hardener\n•	Apply 1 coat of Indoor/Outdoor Varnish and let dry\n•	Lightly sand and apply second coat of Indoor/Outdoor Varnish"},
+    {"Item": "Varnish Wood- Windows/Doors", "Unit": "each", "Material (R/unit)": 175, "Labour (R/unit)": 275,
+     "Default Job Notes": "•	Lightly sand to uniform colour/appearance\n•	Add caulk to frame and wall gaps\n•	Replace cracking/dry or missing putty. Use Putty Hardener\n•	Apply 1 coat of Indoor/Outdoor Varnish and let dry\n•	Lightly sand and apply second coat of Indoor/Outdoor Varnish"},
+    {"Item": "Waterproofing Rising Damp/ Horizontals", "Unit": "m²", "Material (R/unit)": 55, "Labour (R/unit)": 36,
+     "Default Job Notes": "•	Remove all loose contaminants.\n•	Apply 1 coat of Waterpoof Slurry Kit from the floor to +-/ 30cm above the affected area.\n•	Wait 1 to 2 hours and apply second coat of Waterproof Slurry Kit to same area.\n•	Continue with priming and painting."},
+    {"Item": "Waterproofing Roofs/Concrete Deks", "Unit": "m²", "Material (R/unit)": 105, "Labour (R/unit)": 55,
+     "Default Job Notes": "•	Remove all loose contaminants and materials.\n•	Apply flashmesh and coat with PCT36 to corners.\n•	Apply two coats of PCT36 Slurry. Ligtly wet concrete before application.\n•	Continue with priming and painting. PCT must be overcoated with UV resistant coating."},
+    {"Item": "Wood Floors – Sanded to Renew & Varnish", "Unit": "m²", "Material (R/unit)": 105, "Labour (R/unit)": 65,
+     "Default Job Notes": "• Note to Client: This is a dusty process. The complete floor must be done in one stage. The floor must be clear of furniture.\n• Vacuum the floor to remove dust.\n• Apply the first coat of indoor varnish thinned with 10% thinners to penetrate the wood.\n• Sand the first coat with 300-grit sandpaper in circular movements and wipe clean.\n• Apply the final coat. Second painter to lay off the wet varnish to prevent lines -maintaining a wet edge."},
+    {"Item": "Wood Floors/Rails/ Decks Varnish", "Unit": "m²", "Material (R/unit)": 45, "Labour (R/unit)": 55,
+     "Default Job Notes": "• Lightly sand wood to remove loose material and key in the new coat.\n• Apply 2 coats Indoor Varnish for woodwork."},
+    {"Item": "Wood Repair", "Unit": "lm", "Material (R/unit)": 50, "Labour (R/unit)": 50,
+     "Default Job Notes": "•	Remove damaged coating, loose materials or rotten wood.\n•	Sand down reamining wood to uniform matt finish\n•	Prime all replacement pieces of wood with Wood Primer\n•	Spot prime nails, hinges and fittings with Metal Etch Primer\n•	Treat knots or resin marks with Knotting and Wood sealer\n•	Allow to dry and lightly sand to create a good surface for priming"},
+]
+
+
+_ADDITIONAL_RATE_UNIT_OPTIONS = ["per day", "per km", "per 1000 liters", "per litre"]
+_ADDITIONAL_RATE_UNIT_TO_KEY = {
+    "per day": "per_day",
+    "per km": "per_km",
+    "per 1000 liters": "per_1000_liters",
+    "per 1000 litres": "per_1000_liters",
+    "per litre": "per_litre",
+    "per liter": "per_litre",
+}
+
+
+def _rate_unit_to_key(unit: str) -> str:
+    key = _ADDITIONAL_RATE_UNIT_TO_KEY.get((unit or "").strip().lower())
+    if key:
+        return key
+    return (unit or "").strip().lower().replace(" ", "_")
+
+
+# Default additional rates when nothing is saved in the database yet
+DEFAULT_MASTER_ADDITIONAL_RATES = [
+    {"Additional item": "Travel", "Rate unit": "per day", "R/Rate unit": 8},
+    {"Additional item": "Travel", "Rate unit": "per km", "R/Rate unit": 8},
+    {"Additional item": "Hiring of Power Washer", "Rate unit": "per day", "R/Rate unit": 1200},
+    {"Additional item": "Hiring of Toilet", "Rate unit": "per day", "R/Rate unit": 750},
+    {"Additional item": "Skip Hire", "Rate unit": "per day", "R/Rate unit": 450},
+    {"Additional item": "Scaffolding Hire", "Rate unit": "per day", "R/Rate unit": 2300},
+    {"Additional item": "Water Procurement", "Rate unit": "per 1000 liters", "R/Rate unit": 1500},
+    {"Additional item": "Electricity Supply", "Rate unit": "per day", "R/Rate unit": 750},
+]
+
+
+def _sort_master_additional_rates_df(df):
+    """Ensure # column exists, fill gaps, and sort rows by #."""
+    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+        return df
+    df = df.copy().reset_index(drop=True)
+    if "#" not in df.columns:
+        df.insert(0, "#", range(1, len(df) + 1))
+    df["#"] = pd.to_numeric(df["#"], errors="coerce")
+    missing = df["#"].isna()
+    if missing.any():
+        max_n = df.loc[~missing, "#"].max()
+        max_n = int(max_n) if pd.notna(max_n) else 0
+        df.loc[missing, "#"] = list(range(max_n + 1, max_n + 1 + int(missing.sum())))
+    df["#"] = df["#"].astype(int)
+    return df.sort_values("#", kind="stable").reset_index(drop=True)
+
+
+def _df_to_additional_rate_dicts(df):
+    rates, item_order = {}, []
+    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+        return rates, item_order
+    if isinstance(df, pd.DataFrame):
+        df = _sort_master_additional_rates_df(df)
+    for _, row in df.iterrows():
+        item = str(row.get("Additional item", "")).strip()
+        if not item:
+            continue
+        unit = str(row.get("Rate unit", "")).strip()
+        value = float(row["R/Rate unit"]) if pd.notna(row.get("R/Rate unit")) else 0.0
+        key = _rate_unit_to_key(unit)
+        if item not in rates:
+            rates[item] = {}
+            item_order.append(item)
+        rates[item][key] = value
+    return rates, item_order
+
+
+def _update_session_additional_rates_from_df(df=None):
+    if df is None:
+        df = st.session_state.get("master_additional_rates_df")
+    rates, item_order = _df_to_additional_rate_dicts(df)
+    st.session_state.ADDITIONAL_RATES = rates
+    st.session_state.ADDITIONAL_ITEM_ORDER = item_order
+
+
+def _load_master_additional_rates_dataframe():
+    loaded = db_sheets.load_custom_additional_rates()
+    if loaded:
+        data = [
+            {
+                "#": row["sort_order"],
+                "Additional item": row["item"],
+                "Rate unit": row["rate_unit"],
+                "R/Rate unit": row["rate_value"],
+            }
+            for row in loaded
+        ]
+        return pd.DataFrame(data)
+    return pd.DataFrame(DEFAULT_MASTER_ADDITIONAL_RATES)
+
+
+def _normalize_master_additional_rates_df(df=None):
+    if df is None:
+        df = _load_master_additional_rates_dataframe()
+    cols = ["#", "Additional item", "Rate unit", "R/Rate unit"]
+    df = df.copy().reset_index(drop=True)
+    for col in cols:
+        if col not in df.columns:
+            if col == "#":
+                df[col] = range(1, len(df) + 1)
+            elif col == "R/Rate unit":
+                df[col] = 0.0
+            else:
+                df[col] = ""
+    df = df[cols]
+    df["Additional item"] = df["Additional item"].fillna("").astype(str)
+    df["Rate unit"] = df["Rate unit"].fillna("per day").astype(str)
+    df["R/Rate unit"] = pd.to_numeric(df["R/Rate unit"], errors="coerce").fillna(0.0)
+    if "#" not in df.columns:
+        df.insert(0, "#", range(1, len(df) + 1))
+    df["#"] = pd.to_numeric(df["#"], errors="coerce")
+    missing = df["#"].isna()
+    if missing.any():
+        max_n = df.loc[~missing, "#"].max()
+        max_n = int(max_n) if pd.notna(max_n) else 0
+        df.loc[missing, "#"] = list(range(max_n + 1, max_n + 1 + int(missing.sum())))
+    df["#"] = df["#"].astype(int)
+    return df
+
+
+def _prepare_master_additional_rates_df(df=None):
+    return _sort_master_additional_rates_df(_normalize_master_additional_rates_df(df))
+
+
+def _additional_rates_df_to_db_rows(df):
+    rows = []
+    for _, row in _sort_master_additional_rates_df(df).iterrows():
+        item = str(row.get("Additional item", "")).strip()
+        unit = str(row.get("Rate unit", "")).strip()
+        if not item or not unit:
+            continue
+        rows.append(
+            {
+                "sort_order": int(row["#"]),
+                "item": item,
+                "rate_unit": unit,
+                "rate_value": float(row["R/Rate unit"]) if pd.notna(row.get("R/Rate unit")) else 0.0,
+            }
+        )
+    return rows
+
+
+_MASTER_ADDITIONAL_RATES_EDITOR_KEY = "master_additional_rates_editor"
+
+
+def _get_additional_rates():
+    if st.session_state.get("ADDITIONAL_RATES"):
+        return st.session_state.ADDITIONAL_RATES
+    rates, _ = _df_to_additional_rate_dicts(pd.DataFrame(DEFAULT_MASTER_ADDITIONAL_RATES))
+    return rates
+
+
+def _get_additional_item_order():
+    order = st.session_state.get("ADDITIONAL_ITEM_ORDER")
+    if order:
+        return order
+    return list(_get_additional_rates().keys())
+
+
+def _additional_section_cost(sec: dict) -> float:
+    item = sec.get("item", "")
+    rate = _get_additional_rates().get(item, {})
+    if rate.get("per_1000_liters"):
+        liters = float(sec.get("liters", 0) or 0)
+        return (liters / 1000.0) * rate["per_1000_liters"]
+    if rate.get("per_litre"):
+        liters = float(sec.get("liters", 0) or 0)
+        return liters * rate["per_litre"]
+    return (float(sec.get("duration_days", 0) or 0) * rate.get("per_day", 0)) + (
+        float(sec.get("km", 0) or 0) * rate.get("per_km", 0)
+    )
+
+
+def _additional_cost_quote_row(sec: dict) -> dict:
+    cost = _additional_section_cost(sec)
+    item = sec.get("item", "")
+    if item == "Water Procurement":
+        liters = int(sec.get("liters", 1000) or 0)
+        return {
+            "description": item,
+            "type": f"{liters} liters",
+            "amount": f"R{cost:,.2f}",
+        }
+    return {
+        "description": item,
+        "type": f"{sec.get('duration_days', 0)} days",
+        "amount": sec.get("km", 0),
+    }
+
+
+def _notes_key_sig(text):
+    return hashlib.md5((text or "").encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+
+def _default_paint_item():
+    return {"item": "Walls", "method": "Previously painted", "area_m2": 0.0, "job_notes": ""}
+
+
+def _default_paint_section():
+    return {
+        "paint_class": "A",
+        "type": "Exterior",
+        "area_description": "",
+        "items": [_default_paint_item()],
+    }
+
+
+def _normalize_paint_sections(sections):
+    """Ensure each section has an items list; migrate legacy flat sections."""
+    normalized = []
+    for sec in sections or []:
+        if isinstance(sec.get("items"), list) and sec["items"]:
+            normalized.append(sec)
+            continue
+        normalized.append({
+            "paint_class": sec.get("paint_class", "A"),
+            "type": sec.get("type", "Exterior"),
+            "area_description": sec.get("area_description", ""),
+            "items": [{
+                "item": sec.get("item", "Walls"),
+                "method": sec.get("method", "Previously painted"),
+                "area_m2": float(sec.get("area_m2", 0) or 0),
+                "job_notes": sec.get("job_notes", ""),
+            }],
+        })
+    return normalized
+
+
+def _flatten_paint_sections(sections):
+    """One merged dict per line item (section fields + item fields)."""
+    flat = []
+    for sec in _normalize_paint_sections(sections):
+        for item in sec.get("items", []):
+            flat.append({
+                "paint_class": sec.get("paint_class", "A"),
+                "type": sec.get("type", "Exterior"),
+                "area_description": sec.get("area_description", ""),
+                **item,
+            })
+    return flat
+
+
+def _tab1_snapshot_id(paint_sections, additional_sections, job_no, client, total_material, total_labour, add_total):
+    ps = json.dumps(_flatten_paint_sections(paint_sections), sort_keys=True, default=str)
+    ads = json.dumps([{k: s.get(k) for k in ("item", "duration_days", "km", "liters")} for s in additional_sections], sort_keys=True, default=str)
+    raw = f"{job_no}|{client}|{total_material:.4f}|{total_labour:.4f}|{add_total:.4f}|{ps}|{ads}"
+    return hashlib.md5(raw.encode("utf-8", errors="ignore")).hexdigest()
+
+def _tab2_combined_area_desc(sec: dict) -> str:
+    """Area description plus Interior/Exterior type from Tab 1."""
+    area_desc = str(sec.get("area_description", "") or "").strip()
+    paint_type = str(sec.get("type", "") or "").strip()
+    if area_desc and paint_type:
+        return f"{area_desc} - {paint_type}"
+    return area_desc or paint_type
+
+
+def _tab2_spec_df_from_paint_sections(paint_sections: list, item_units: dict) -> pd.DataFrame:
+    """Builds the Tab 2 spec dataframe from Tab 1 paint sections."""
+    rows = []
+    for sec_idx, sec in enumerate(_normalize_paint_sections(paint_sections), 1):
+        for item_data in sec.get("items", []):
+            line = {**sec, **item_data}
+            item = line.get("item", "")
+            unit = item_units.get(item, line.get("unit", "m²"))
+            qty = float(line.get("area_m2", 0) or 0)
+            rows.append({
+                "Section": str(sec_idx),
+                "Area Description": _tab2_combined_area_desc(line),
+                "Unit": unit,
+                "Quantity": qty,
+                "Job Notes": line.get("job_notes", line.get("job_note", "")),
+            })
+    return pd.DataFrame(rows)
+
+
+def _tab2_quantity_with_unit(qty, unit: str) -> str:
+    """PDF quantity cell: value and unit in one field (e.g. '45.50 m²')."""
+    qty_str = f"{float(qty or 0):.2f}"
+    unit_str = str(unit or "").strip()
+    return f"{qty_str} {unit_str}".strip() if unit_str else qty_str
+
+
+def _tab2_job_notes_to_steps(text: str) -> list:
+    """Split job notes into numbered steps for the Job Spec PDF."""
+    steps = []
+    for line in str(text or "").replace("\r\n", "\n").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        line = re.sub(r"^[\s•\-\*]+", "", line)
+        line = re.sub(r"^\d+[\.\)]\s*", "", line)
+        if line:
+            steps.append(line)
+    return steps
+
+
+def _tab2_job_spec_section_title(section_num: str, sec: dict, row: pd.Series = None) -> str:
+    """Format: '1. ITEM – TYPE – AREA Description'."""
+    item = str(sec.get("item", "") or "").strip()
+    paint_type = str(sec.get("type", "") or "").strip()
+    area_desc = str(sec.get("area_description", "") or "").strip()
+    if not area_desc and row is not None:
+        area_desc = str(
+            row.get("Area Description", row.get("Area Description - Internal/External", "")) or ""
+        ).strip()
+    title_parts = [p for p in (item, paint_type, area_desc) if p]
+    if not title_parts and row is not None:
+        title_parts = [str(row.get("Area Description", "") or "").strip()]
+    return f"{section_num}. {' – '.join(title_parts)}" if title_parts else str(section_num)
+
+
+def _tab2_job_spec_sections(paint_sections: list, edited_spec: pd.DataFrame) -> list:
+    """Section blocks for Tab 2 Job Spec PDF (no table)."""
+    sections = []
+    flat_sections = _flatten_paint_sections(paint_sections)
+    if edited_spec is not None and not edited_spec.empty:
+        for idx, (_, r) in enumerate(edited_spec.iterrows()):
+            sec = flat_sections[idx] if idx < len(flat_sections) else {}
+            section_num = str(r.get("Section", idx + 1)).replace("Section ", "").strip()
+            job_notes = r.get("Job Notes", r.get("Job Note", ""))
+            if sec and not str(job_notes or "").strip():
+                job_notes = sec.get("job_notes", sec.get("job_note", ""))
+            unit = r.get("Unit", sec.get("unit", ""))
+            qty = r.get("Quantity", sec.get("area_m2", 0) or 0)
+            md = float(r.get("MD /Section", 0) or 0)
+            sections.append({
+                "title": _tab2_job_spec_section_title(section_num, sec, r),
+                "qty_line": (
+                    f"{_tab2_quantity_with_unit(qty, unit)} - {md:.2f} Man-days/section"
+                ),
+                "job_note_steps": _tab2_job_notes_to_steps(job_notes),
+                "notes": str(r.get("Notes", "") or ""),
+            })
+    else:
+        for i, sec in enumerate(flat_sections, 1):
+            md = float(sec.get("md_section", 0) or 0)
+            sections.append({
+                "title": _tab2_job_spec_section_title(str(i), sec),
+                "qty_line": (
+                    f"{_tab2_quantity_with_unit(sec.get('area_m2', 0), sec.get('unit', ''))}"
+                    f" - {md:.2f} Man-days/section"
+                ),
+                "job_note_steps": _tab2_job_notes_to_steps(
+                    sec.get("job_notes", sec.get("job_note", ""))
+                ),
+                "notes": "",
+            })
+    return sections
+
+def _tab2_area_display_text(area: str, job_notes: str) -> str:
+    """Area + job notes in one cell (matches PDF content; formatting on PDF only)."""
+    area = str(area or "").strip()
+    notes = str(job_notes or "").strip()
+    if area and notes:
+        return f"{area}\n\n{notes}"
+    return area or notes
+
+
+def _tab2_rows_fingerprint(paint_sections):
+    rows = []
+    for i, sec in enumerate(_flatten_paint_sections(paint_sections)):
+        rows.append((i, sec.get("item"), round(float(sec.get("area_m2", 0) or 0), 4)))
+    return hashlib.md5(json.dumps(rows, default=str).encode("utf-8", errors="ignore")).hexdigest()
+
+def _safe_filename_part(text: str, fallback: str = "Unknown") -> str:
+    """Sanitize one segment of a download filename."""
+    s = re.sub(r'[<>:"/\\|?*]', "", str(text or "").strip())
+    s = s.replace(" ", "_")
+    return s or fallback
+
+_TAB_EXPORT_FILENAME_SUFFIX = {
+    1: None,
+    2: "JobSpec",
+    3: "Attendance&Bonus",
+    4: "EmploymentContract",
+}
+
+
+def _download_filename(
+    quote_number,
+    client_name,
+    extension: str,
+    *,
+    tab_number: int | None = None,
+    extra_suffix: str | None = None,
+) -> str:
+    """Build download name for tab exports (tabs 1–4 use fixed suffix rules)."""
+    ext = extension.lstrip(".")
+    name = (
+        f"{_safe_filename_part(quote_number, 'Quote')}_"
+        f"{_safe_filename_part(client_name, 'Client')}"
+    )
+    if tab_number in _TAB_EXPORT_FILENAME_SUFFIX:
+        suffix = _TAB_EXPORT_FILENAME_SUFFIX[tab_number]
+        if suffix:
+            name = f"{name}_{suffix}"
+    elif extra_suffix:
+        name = f"{name}_{_safe_filename_part(extra_suffix, 'Export')}"
+    return f"{name}.{ext}"
+
+_TAB_LABELS = [
+    "Master Rates",
+    "1. Quote Breakdown (Start Here)",
+    "2. Job Spec & Site Man-Days",
+    "3. Attendance & Bonus",
+    "4. Employment Contract",
+    "5. Dashboard",
+]
+
+tab_master, tab_quote, tab2, tab3, tab4, tab5 = st.tabs(
+    _TAB_LABELS, default="1. Quote Breakdown (Start Here)", key="ppt_nav_tab"
+)
+
+def get_email_config():
+    """Load full SMTP config from email_config.txt (next to app.py)"""
+    config_file = os.path.join(".", 'email_config.txt')
+    if not os.path.exists(config_file):
+        return None
+    config = {}
+    with open(config_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            if '=' in line:
+                key, value = line.strip().split('=', 1)
+                config[key.strip().lower()] = value.strip()
+    if not all(k in config for k in ['sender_email', 'password']):
+        return None
+    if 'smtp_server' not in config:
+        config['smtp_server'] = 'mail.' + config['sender_email'].split('@')[1]
+    if 'smtp_port' not in config:
+        config['smtp_port'] = '587'
+    if 'use_tls' not in config:
+        config['use_tls'] = 'True'
+    return config
+
+def send_quote_email(to_email, subject, body, attachment_buf, filename, config):
+    """Send email with your custom SMTP settings"""
+    msg = MIMEMultipart()
+    msg['From'] = config['sender_email']
+    msg['To'] = to_email
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'plain'))
+
+    part = MIMEApplication(attachment_buf.getvalue(), Name=filename)
+    part['Content-Disposition'] = f'attachment; filename="{filename}"'
+    msg.attach(part)
+
+    try:
+        smtp_server = config['smtp_server']
+        smtp_port = int(config['smtp_port'])
+        if config.get('use_ssl', '').lower() == 'true':
+            server = smtplib.SMTP_SSL(smtp_server, smtp_port)
+        else:
+            server = smtplib.SMTP(smtp_server, smtp_port)
+            if config.get('use_tls', 'True').lower() == 'true':
+                server.starttls()
+        server.login(config['sender_email'], config['password'])
+        server.send_message(msg)
+        server.quit()
+        return True, f"✅ Email sent successfully to {to_email}"
+    except Exception as e:
+        return False, f"❌ Email failed: {str(e)}"
+
+# ====================== TAB 0: MASTER RATES ======================
+
+
+def _master_rates_column_config():
+    return {
+        "#": st.column_config.NumberColumn("#", min_value=1, step=1, width="small"),
+        "Item": st.column_config.TextColumn("Item", width="medium"),
+        "Unit": st.column_config.SelectboxColumn(
+            "Unit", options=["m²", "lm", "each", "sum"], default="m²"
+        ),
+        "Material (R/unit)": st.column_config.NumberColumn(
+            "Material (R/unit)", format="R%.2f", min_value=0, default=0.0
+        ),
+        "Labour (R/unit)": st.column_config.NumberColumn(
+            "Labour (R/unit)", format="R%.2f", min_value=0, default=0.0
+        ),
+        "Default Job Notes": st.column_config.TextColumn("Default Job Notes", width="large"),
+    }
+
+
+def _master_additional_rates_column_config():
+    return {
+        "#": st.column_config.NumberColumn("#", min_value=1, step=1, width="small"),
+        "Additional item": st.column_config.TextColumn("Additional item", width="medium"),
+        "Rate unit": st.column_config.SelectboxColumn(
+            "Rate unit",
+            options=_ADDITIONAL_RATE_UNIT_OPTIONS,
+            default="per day",
+            width="medium",
+        ),
+        "R/Rate unit": st.column_config.NumberColumn(
+            "R/Rate unit", format="R%.2f", min_value=0, default=0.0
+        ),
+    }
+
+
+with tab_master:
+    st.header("Master Rates")
+    st.caption(
+        "Edit rates below — the page will not refresh while you type. "
+        "Use # for row order. Click **Save** to sort rows by # and store permanently in the database."
+    )
+
+    if "rates_version" not in st.session_state:
+        st.session_state.rates_version = 0
+
+    if "master_rates_df" not in st.session_state:
+        st.session_state.master_rates_df = _prepare_master_rates_df()
+        st.session_state.item_rates_df = st.session_state.master_rates_df.copy()
+        _update_session_rates_from_df(st.session_state.master_rates_df)
+    elif "#" not in st.session_state.master_rates_df.columns:
+        st.session_state.master_rates_df = _prepare_master_rates_df(st.session_state.master_rates_df)
+
+    if "master_additional_rates_df" not in st.session_state:
+        st.session_state.master_additional_rates_df = _prepare_master_additional_rates_df()
+        _update_session_additional_rates_from_df(st.session_state.master_additional_rates_df)
+    elif "#" not in st.session_state.master_additional_rates_df.columns:
+        st.session_state.master_additional_rates_df = _prepare_master_additional_rates_df(
+            st.session_state.master_additional_rates_df
+        )
+
+    st.session_state.pop("master_rates_editor_df", None)
+    st.session_state.pop("master_additional_rates_editor_df", None)
+
+    st.subheader("Paint Specification Rates")
+
+    # Form batches all table edits: no script rerun until a submit button is pressed.
+    with st.form("master_rates_form", clear_on_submit=False, border=False):
+        edited_df = st.data_editor(
+            st.session_state.master_rates_df,
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            key=_MASTER_RATES_EDITOR_KEY,
+            column_config=_master_rates_column_config(),
+        )
+        btn_save, btn_reset, btn_cancel = st.columns(3)
+        save_clicked = btn_save.form_submit_button(
+            "💾 Save paint specification rates", type="primary", use_container_width=True
+        )
+        reset_clicked = btn_reset.form_submit_button(
+            "🔄 Reset paint rates to factory defaults", use_container_width=True
+        )
+        cancel_clicked = btn_cancel.form_submit_button(
+            "❌ Cancel / Discard paint rate changes", use_container_width=True
+        )
+
+    if save_clicked:
+        sorted_df = _prepare_master_rates_df(edited_df)
+        _mr, _mu, _mn = _df_to_rate_dicts(sorted_df)
+        db_sheets.save_custom_rates(_mr, _mu, _mn)
+        st.session_state.master_rates_df = sorted_df
+        st.session_state.item_rates_df = sorted_df.copy()
+        st.session_state.ITEM_RATES = _mr
+        st.session_state.ITEM_UNITS = _mu
+        st.session_state.DEFAULT_JOB_NOTES = _mn
+        st.session_state.rates_version += 1
+        _clear_streamlit_widget_key(_MASTER_RATES_EDITOR_KEY)
+        st.success("✅ Paint specification rates saved permanently!")
+        st.rerun()
+
+    if reset_clicked:
+        _mr, _mu, _mn = _df_to_rate_dicts(pd.DataFrame(DEFAULT_MASTER_RATES))
+        db_sheets.save_custom_rates(_mr, _mu, _mn)
+        st.session_state.master_rates_df = _prepare_master_rates_df(pd.DataFrame(DEFAULT_MASTER_RATES))
+        st.session_state.item_rates_df = st.session_state.master_rates_df.copy()
+        _update_session_rates_from_df(st.session_state.master_rates_df)
+        st.session_state.rates_version += 1
+        _clear_streamlit_widget_key(_MASTER_RATES_EDITOR_KEY)
+        st.success("Factory default paint rates restored.")
+        st.rerun()
+
+    if cancel_clicked:
+        st.session_state.master_rates_df = _prepare_master_rates_df(_load_master_rates_dataframe())
+        st.session_state.item_rates_df = st.session_state.master_rates_df.copy()
+        _update_session_rates_from_df(st.session_state.master_rates_df)
+        st.session_state.rates_version += 1
+        _clear_streamlit_widget_key(_MASTER_RATES_EDITOR_KEY)
+        st.rerun()
+
+    st.divider()
+    st.subheader("Additional Rates")
+
+    with st.form("master_additional_rates_form", clear_on_submit=False, border=False):
+        edited_additional_df = st.data_editor(
+            st.session_state.master_additional_rates_df,
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            key=_MASTER_ADDITIONAL_RATES_EDITOR_KEY,
+            column_config=_master_additional_rates_column_config(),
+        )
+        add_btn_save, add_btn_reset, add_btn_cancel = st.columns(3)
+        add_save_clicked = add_btn_save.form_submit_button(
+            "💾 Save additional rates", type="primary", use_container_width=True
+        )
+        add_reset_clicked = add_btn_reset.form_submit_button(
+            "🔄 Reset additional rates to factory defaults", use_container_width=True
+        )
+        add_cancel_clicked = add_btn_cancel.form_submit_button(
+            "❌ Cancel / Discard additional rate changes", use_container_width=True
+        )
+
+    if add_save_clicked:
+        sorted_additional_df = _prepare_master_additional_rates_df(edited_additional_df)
+        db_sheets.save_custom_additional_rates(_additional_rates_df_to_db_rows(sorted_additional_df))
+        st.session_state.master_additional_rates_df = sorted_additional_df
+        _update_session_additional_rates_from_df(sorted_additional_df)
+        st.session_state.rates_version += 1
+        _clear_streamlit_widget_key(_MASTER_ADDITIONAL_RATES_EDITOR_KEY)
+        st.success("✅ Additional rates saved permanently!")
+        st.rerun()
+
+    if add_reset_clicked:
+        default_additional_df = _prepare_master_additional_rates_df(
+            pd.DataFrame(DEFAULT_MASTER_ADDITIONAL_RATES)
+        )
+        db_sheets.save_custom_additional_rates(_additional_rates_df_to_db_rows(default_additional_df))
+        st.session_state.master_additional_rates_df = default_additional_df
+        _update_session_additional_rates_from_df(default_additional_df)
+        st.session_state.rates_version += 1
+        _clear_streamlit_widget_key(_MASTER_ADDITIONAL_RATES_EDITOR_KEY)
+        st.success("Factory default additional rates restored.")
+        st.rerun()
+
+    if add_cancel_clicked:
+        st.session_state.master_additional_rates_df = _prepare_master_additional_rates_df(
+            _load_master_additional_rates_dataframe()
+        )
+        _update_session_additional_rates_from_df(st.session_state.master_additional_rates_df)
+        st.session_state.rates_version += 1
+        _clear_streamlit_widget_key(_MASTER_ADDITIONAL_RATES_EDITOR_KEY)
+        st.rerun()
+
+# ====================== TAB 1: QUOTE BREAKDOWN ======================
+with tab_quote:
+    st.title("Pro Paint Teams Quote")
+
+    # Live rates from Master Rates (single source of truth)
+    ITEM_RATES = st.session_state.get("ITEM_RATES", {})
+    ITEM_UNITS = st.session_state.get("ITEM_UNITS", {})
+    DEFAULT_JOB_NOTES = st.session_state.get("DEFAULT_JOB_NOTES", {})
+
+    # Fallback if Master Rates tab has not populated session yet
+    if not ITEM_RATES:
+        _rates_df = st.session_state.get("master_rates_df") or st.session_state.get("item_rates_df")
+        if _rates_df is None or (isinstance(_rates_df, pd.DataFrame) and _rates_df.empty):
+            _rates_df = _prepare_master_rates_df()
+            st.session_state.master_rates_df = _rates_df
+            st.session_state.item_rates_df = _rates_df
+        ITEM_RATES, ITEM_UNITS, DEFAULT_JOB_NOTES = _df_to_rate_dicts(_rates_df)
+        st.session_state.ITEM_RATES = ITEM_RATES
+        st.session_state.ITEM_UNITS = ITEM_UNITS
+        st.session_state.DEFAULT_JOB_NOTES = DEFAULT_JOB_NOTES
+
+    if not st.session_state.get("ADDITIONAL_RATES"):
+        _add_rates_df = st.session_state.get("master_additional_rates_df")
+        if _add_rates_df is None or (isinstance(_add_rates_df, pd.DataFrame) and _add_rates_df.empty):
+            _add_rates_df = _prepare_master_additional_rates_df()
+            st.session_state.master_additional_rates_df = _add_rates_df
+        _update_session_additional_rates_from_df(_add_rates_df)
+
+    METHOD_MATERIAL_RATES = {'Previously painted': 10, 'New Build': 20}
+    CLASS_MULTIPLIERS = {'A': 1.0, 'B': 1.15, 'C': 1.25}
+
+    def calculate_section(section):
+        cls = section.get('paint_class', 'A')
+        item = section.get('item', 'Walls')
+        method = section.get('method', 'Previously painted')
+        area = float(section.get('area_m2', 0))
+        mult = CLASS_MULTIPLIERS.get(cls, 1.0)
+
+        item_rates = ITEM_RATES.get(item, {'material': 0, 'labour': 0})
+        base_material = item_rates['material'] * mult
+        base_labour = item_rates['labour'] * mult
+        method_material = METHOD_MATERIAL_RATES.get(method, 0) * mult
+
+        material_total = area * (base_material + method_material)
+        labour_total = area * base_labour
+        return round(material_total, 2), round(labour_total, 2)
+
+    # Area Manager Information
+    AREA_MANAGERS = {
+        "CS": {"name": "Mirven Julies", "phone": "065 506 0964", "email": "mirven@propaintteams.co.za"},
+        "CEM": {"name": "Pieter Visser", "phone": "083 407 7688", "email": "pieter@propaintteams.co.za"},
+        "CAW": {"name": "Heinrich Bleuler", "phone": "071 308 5101", "email": "heinrich@propaintteams.co.za"},
+    }
+
+    def get_next_quote_number(area_code):
+        if not DB_READY: return f"{area_code}001"
+        try:
+            jobs_df = _cached_jobs()
+            if jobs_df.empty: return f"{area_code}001"
+            area_jobs = jobs_df[jobs_df["Job No"].astype(str).str.startswith(area_code)]
+            if area_jobs.empty: return f"{area_code}001"
+            numbers = [int(jno[len(area_code):].strip()) for jno in area_jobs["Job No"].astype(str) if jno.startswith(area_code) and jno[len(area_code):].strip().isdigit()]
+            return f"{area_code}{max(numbers)+1:03d}" if numbers else f"{area_code}001"
+        except:
+            return f"{area_code}001"
+
+    def on_area_change():
+        area = st.session_state.get("area_code")
+        if area in AREA_MANAGERS:
+            st.session_state.am_name = AREA_MANAGERS[area]["name"]
+            st.session_state.am_phone = AREA_MANAGERS[area]["phone"]
+            st.session_state.am_email = AREA_MANAGERS[area]["email"]
+        st.session_state.job_no = get_next_quote_number(area)
+
+    st.subheader("Area Manager Information")
+    am_cols = st.columns([1, 2, 2, 3])
+    with am_cols[0]:
+        st.selectbox("Area", options=list(AREA_MANAGERS.keys()), key="area_code", on_change=on_area_change, index=2)
+    with am_cols[1]: area_manager = st.text_input("Area Manager Name", key="am_name")
+    with am_cols[2]: am_phone = st.text_input("Phone Number", key="am_phone")
+    with am_cols[3]: am_email = st.text_input("Email Address", key="am_email")
+
+    # Client Information
+    st.subheader("Client Information")
+    client_options = ["— New Client —"]
+    if DB_READY:
+        try:
+            clients_df = db_sheets.get_all_clients()
+            if not clients_df.empty:
+                client_options += sorted(clients_df["client"].astype(str).unique().tolist())
+        except: pass
+
+    def on_client_selected():
+        selected = st.session_state.get("client_select")
+        if selected == "— New Client —" or not DB_READY: return
+        try:
+            clients_df = db_sheets.get_all_clients()
+            row = clients_df[clients_df["client"] == selected].iloc[0]
+            st.session_state.client = row.get("client", selected)
+            st.session_state.client_phone = row.get("phone", "")
+            st.session_state.client_email = row.get("email", "")
+            st.session_state.client_address = row.get("address", "")
+        except: pass
+
+    c_cols = st.columns(2)
+    with c_cols[0]:
+        st.selectbox("Select Existing Client", options=client_options, key="client_select", on_change=on_client_selected, index=0)
+        client = st.text_input("Client Name (or edit selected)", key="client")
+        client_phone = st.text_input("Phone Number", key="client_phone")
+        client_email = st.text_input("Email Address", key="client_email")
+    with c_cols[1]:
+        client_address = st.text_input("Physical Address", key="client_address")
+        job_no = st.text_input("Quote Number", key="job_no")
+        quote_date = st.date_input("Date of Quote", value=date.today(), key="quote_date")
+
+    # Paint Specification Sections
+    st.subheader("Paint Specification Sections")
+    if "paint_sections" not in st.session_state:
+        st.session_state.paint_sections = [{
+            "paint_class": "A", "type": "Exterior", "area_description": "Roofslab",
+            "items": [{
+                "item": "Waterproofing", "method": "Previously painted", "area_m2": 20.0,
+                "job_notes": "",
+            }],
+        }]
+    else:
+        st.session_state.paint_sections = _normalize_paint_sections(st.session_state.paint_sections)
+
+    total_material = total_labour = 0.0
+    version = st.session_state.get("rates_version", 0)
+
+    item_options = list(ITEM_RATES.keys())
+    if not item_options:
+        item_options = ["Walls"]
+
+    for i, section in enumerate(st.session_state.paint_sections):
+        with st.expander(f"Section {i+1}", expanded=True):
+            cols = st.columns(2)
+            with cols[0]:
+                section["paint_class"] = st.selectbox(
+                    "Paint Job Class", ["A", "B", "C"], key=f"class_{i}"
+                )
+            with cols[1]:
+                section["type"] = st.selectbox(
+                    "Type", ["Interior", "Exterior"], key=f"type_{i}"
+                )
+            section["area_description"] = st.text_input(
+                "Area Description",
+                section.get("area_description", ""),
+                key=f"desc_{i}",
+            )
+
+            if not section.get("items"):
+                section["items"] = [_default_paint_item()]
+
+            for j, item in enumerate(section["items"]):
+                st.markdown(f"**Item {j + 1}**")
+                if item.get("item") not in ITEM_RATES:
+                    item["item"] = item_options[0]
+
+                icols = st.columns(3)
+                with icols[0]:
+                    item["item"] = st.selectbox(
+                        "Item", options=item_options, key=f"item_{i}_{j}_v{version}"
+                    )
+                with icols[1]:
+                    item["method"] = st.selectbox(
+                        "Method",
+                        list(METHOD_MATERIAL_RATES.keys()),
+                        key=f"method_{i}_{j}",
+                    )
+                with icols[2]:
+                    unit = ITEM_UNITS.get(item["item"], "m²")
+                    item["area_m2"] = st.number_input(
+                        f"Area ({unit})",
+                        value=float(item.get("area_m2", 0)),
+                        step=0.1,
+                        key=f"area_m2_{i}_{j}",
+                    )
+
+                default_notes = DEFAULT_JOB_NOTES.get(item["item"], "")
+                _notes_key = (
+                    f"notes_{i}_{j}_{item['item']}_v{version}_{_notes_key_sig(default_notes)}"
+                )
+                item["job_notes"] = st.text_area(
+                    "Job Notes", value=default_notes, key=_notes_key, height=120
+                )
+
+                line = {**section, **item}
+                mat, lab = calculate_section(line)
+                total_material += mat
+                total_labour += lab
+                st.info(f"**Material:** R{mat:,.2f}  **Labour:** R{lab:,.2f}")
+
+                if len(section["items"]) > 1 and st.button(
+                    "🗑️ Remove Item", key=f"rem_item_{i}_{j}"
+                ):
+                    section["items"].pop(j)
+                    st.rerun()
+
+            if st.button("➕ Add Item to Section", key=f"add_item_{i}"):
+                section["items"].append(_default_paint_item())
+                st.rerun()
+
+            if st.button("🗑️ Remove Section", key=f"rem_p_{i}"):
+                st.session_state.paint_sections.pop(i)
+                st.rerun()
+
+    if st.button("➕ Add Paint Specification Section"):
+        st.session_state.paint_sections.append(_default_paint_section())
+        st.rerun()
+
+    # Additional Sections
+    st.subheader("Additional Sections")
+    if "additional_sections" not in st.session_state:
+        st.session_state.additional_sections = []
+
+    add_total = 0.0
+    for i, sec in enumerate(st.session_state.additional_sections):
+        with st.expander(f"Additional Section {i+1}", expanded=True):
+            col1, col2, col3 = st.columns([2, 1.5, 1.5])
+            with col1:
+                sec["item"] = st.selectbox(
+                    "Additional Item",
+                    options=_get_additional_item_order(),
+                    key=f"add_item_{i}",
+                )
+            if sec["item"] == "Water Procurement":
+                with col2:
+                    sec["liters"] = st.number_input(
+                        "Quantity (liters)",
+                        value=float(sec.get("liters", 1000)),
+                        min_value=0.0,
+                        step=100.0,
+                        key=f"add_liters_{i}",
+                    )
+                sec["duration_days"] = 0
+                sec["km"] = 0
+            elif sec["item"] in ["Travel", "Delivery"]:
+                with col2:
+                    sec["duration_days"] = st.number_input(
+                        "Duration (days)",
+                        value=sec.get("duration_days", 3),
+                        min_value=0,
+                        step=1,
+                        key=f"add_dur_{i}",
+                    )
+                with col3:
+                    sec["km"] = st.number_input(
+                        "Distance (KM)",
+                        value=sec.get("km", 80),
+                        min_value=0,
+                        step=10,
+                        key=f"add_km_{i}",
+                    )
+            else:
+                with col2:
+                    sec["duration_days"] = st.number_input(
+                        "Duration (days)",
+                        value=sec.get("duration_days", 1),
+                        min_value=0,
+                        step=1,
+                        key=f"add_dur_{i}",
+                    )
+                sec["km"] = 0
+            cost = _additional_section_cost(sec)
+            add_total += cost
+            st.success(f"**Cost: R{cost:,.2f}**")
+            if st.button("🗑️ Remove Additional", key=f"rem_a_{i}"):
+                st.session_state.additional_sections.pop(i)
+                st.rerun()
+
+    if st.button("➕ Add Additional Section"):
+        st.session_state.additional_sections.append({"item": "Travel", "duration_days": 3, "km": 80})
+        st.rerun()
+
+    # Quote Summary
+    st.subheader("Quote Summary")
+    grand_total = total_material + total_labour + add_total
+    col1, col2, col3, col4 = st.columns(4)
+    with col1: st.metric("Materials Total", f"R{total_material:,.2f}")
+    with col2: st.metric("Labour Total", f"R{total_labour:,.2f}")
+    with col3: st.metric("Additional Costs", f"R{add_total:,.2f}")
+    with col4: st.metric("**Grand Total**", f"**R{grand_total:,.2f}**")
+
+    # Export to Word
+    if st.button("📄 Export to Word – Exact same as index.html", type="primary", use_container_width=True, key="export_word_btn"):
+        try:
+            from docxtpl import DocxTemplate
+            import io, os
+            if not os.path.exists("template.docx"):
+                st.error("❌ template.docx not found!")
+                st.stop()
+
+            tpl = DocxTemplate("template.docx")
+
+            paint_specs = []
+            for sec in _flatten_paint_sections(st.session_state.paint_sections):
+                if sec.get("area_m2", 0) <= 0: continue
+                mat, lab = calculate_section(sec)
+                unit = ITEM_UNITS.get(sec.get("item", ""), "m²")
+                paint_specs.append({
+                    "type": sec.get("type", ""), "item": sec.get("item", ""), "method": sec.get("method", ""),
+                    "converted": str(int(sec.get("area_m2", 0))), "unit": unit,
+                    "class": sec.get("paint_class", "A"),
+                    "area_description": sec.get("area_description", ""),
+                    "job_notes": sec.get("job_notes", ""),
+                    "materialcost": f"R{mat:,.2f}", "labourcost": f"R{lab:,.2f}"
+                })
+
+            additional_costs = [
+                _additional_cost_quote_row(sec) for sec in st.session_state.additional_sections
+            ]
+
+            context = {
+                "clientname": client, "clientaddress": client_address,
+                "clientphone": client_phone, "clientemail": client_email,
+                "areaManagerName": area_manager, "areaManagerPhone": am_phone, "areaManagerEmail": am_email,
+                "quotedate": quote_date.strftime("%Y-%m-%d"), "quotenumber": job_no,
+                "paint_specs": paint_specs, "additional_costs": additional_costs,
+                "materialtotal": f"R{total_material:,.2f}", "labourtotal": f"R{total_labour:,.2f}",
+                "additionaltotal": f"R{add_total:,.2f}", "grandtotal": f"R{grand_total:,.2f}",
+                "grandtotal50": f"R{grand_total*0.5:,.2f}"
+            }
+
+            tpl.render(context)
+            bio = io.BytesIO()
+            tpl.save(bio)
+            bio.seek(0)
+
+            st.download_button(
+                "✅ Download Quote.docx",
+                data=bio.getvalue(),
+                file_name=_download_filename(job_no, client, "docx", tab_number=1),
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True
+            )
+            st.success("✅ Quote exported successfully!")
+        except Exception as e:
+            st.error(f"Export error: {e}")
+
+    # Email Quote as PDF
+    if st.button("📧 Email Quote to Client (as PDF)", type="secondary", use_container_width=True, key="email_quote_btn"):
+        try:
+            from docxtpl import DocxTemplate
+            import io, tempfile, os
+
+            pythoncom.CoInitialize()
+
+            if not os.path.exists("template.docx"):
+                st.error("❌ template.docx not found!")
+                st.stop()
+
+            tpl = DocxTemplate("template.docx")
+
+            paint_specs = []
+            for sec in _flatten_paint_sections(st.session_state.paint_sections):
+                if sec.get("area_m2", 0) <= 0: continue
+                mat, lab = calculate_section(sec)
+                unit = ITEM_UNITS.get(sec.get("item", ""), "m²")
+                paint_specs.append({
+                    "type": sec.get("type", ""), 
+                    "item": sec.get("item", ""), 
+                    "method": sec.get("method", ""),
+                    "converted": str(int(sec.get("area_m2", 0))), 
+                    "unit": unit,
+                    "class": sec.get("paint_class", "A"),
+                    "area_description": sec.get("area_description", ""),
+                    "job_notes": sec.get("job_notes", ""),
+                    "materialcost": f"R{mat:,.2f}", 
+                    "labourcost": f"R{lab:,.2f}"
+                })
+
+            additional_costs = [
+                _additional_cost_quote_row(sec) for sec in st.session_state.additional_sections
+            ]
+
+            context = {
+                "clientname": client, 
+                "clientaddress": client_address,
+                "clientphone": client_phone, 
+                "clientemail": client_email,
+                "areaManagerName": area_manager, 
+                "areaManagerPhone": am_phone, 
+                "areaManagerEmail": am_email,
+                "quotedate": quote_date.strftime("%Y-%m-%d"), 
+                "quotenumber": job_no,
+                "paint_specs": paint_specs, 
+                "additional_costs": additional_costs,
+                "materialtotal": f"R{total_material:,.2f}", 
+                "labourtotal": f"R{total_labour:,.2f}",
+                "additionaltotal": f"R{add_total:,.2f}", 
+                "grandtotal": f"R{grand_total:,.2f}",
+                "grandtotal50": f"R{grand_total*0.5:,.2f}"
+            }
+
+            tpl.render(context)
+            docx_bio = io.BytesIO()
+            tpl.save(docx_bio)
+            docx_bio.seek(0)
+
+            with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp_docx:
+                tmp_docx.write(docx_bio.getvalue())
+                tmp_docx_path = tmp_docx.name
+
+            tmp_pdf_path = tmp_docx_path.replace(".docx", ".pdf")
+            _convert_docx_to_pdf(tmp_docx_path, tmp_pdf_path)
+
+            with open(tmp_pdf_path, "rb") as f:
+                pdf_bio = io.BytesIO(f.read())
+            pdf_bio.seek(0)
+
+            os.unlink(tmp_docx_path)
+            if os.path.exists(tmp_pdf_path):
+                os.unlink(tmp_pdf_path)
+
+            pythoncom.CoUninitialize()
+
+            email_config = get_email_config()
+            if not email_config:
+                st.error("❌ email_config.txt not found or incomplete.")
+                st.stop()
+
+            client_email = client_email.strip()
+            if not client_email:
+                st.error("Please enter the client's email address first.")
+                st.stop()
+
+            subject = f"Pro Paint Teams Quote {job_no} – {client}"
+            body = f"""Dear {client},
+
+Please find attached your detailed quotation (Quote {job_no}).
+
+The quote is valid for 14 days. Should you have any questions or wish to proceed, please don’t hesitate to contact me directly.
+
+Best regards,  
+{area_manager}  
+{am_phone}  
+Pro Paint Teams"""
+
+            filename = _download_filename(job_no, client, "pdf", tab_number=1)
+
+            success, message = send_quote_email(
+                client_email, subject, body, pdf_bio, filename, email_config
+            )
+
+            if success:
+                st.success(message)
+            else:
+                st.error(message)
+
+        except ImportError as e:
+            st.error(f"❌ Missing package for email export: {e}")
+        except Exception as e:
+            st.error(
+                f"PDF conversion / Email error: {e}\n\n"
+                "Tips: close any stuck Word windows, ensure Microsoft Word is installed, "
+                "then try again."
+            )
+        finally:
+            try:
+                pythoncom.CoUninitialize()
+            except:
+                pass
+
+    # Save to Database
+    st.divider()
+    if DB_READY:
+        if st.button("💾 Save Quote & Client to Cloud Database", type="primary", use_container_width=True, key="save_quote_btn"):
+            try:
+                db_sheets.save_client(client, client_phone, client_email, client_address)
+                db_sheets.save_job(job_no=job_no, job_name=client, client=client,
+                                   area_manager=area_manager, team_leader="", start_date=quote_date,
+                                   total_labour=total_labour, man_days_available=0)
+                _clear_cloud_cache()
+                st.success(f"✅ Quote **{job_no}** saved!")
+            except Exception as e:
+                st.error(f"Save error: {e}")
+
+    # Data bridge for other tabs
+    st.session_state.total_material = total_material
+    st.session_state.total_labour = total_labour
+    st.session_state.additional_total = add_total
+    st.session_state.grand_total = grand_total
+    st.session_state.man_days_available = total_labour / 350 if total_labour > 0 else 0.0
+    st.session_state.paint_sections_for_tab2 = st.session_state.paint_sections.copy()
+    if "tab1_data" not in st.session_state:
+        st.session_state.tab1_data = {}
+    _snap = _tab1_snapshot_id(
+        st.session_state.paint_sections,
+        st.session_state.additional_sections,
+        job_no, client, total_material, total_labour, add_total,
+    )
+    st.session_state.tab1_data.update({
+        "job_no": job_no, "client": client, "client_phone": client_phone, "client_email": client_email,
+        "client_address": client_address, "area_manager": area_manager, "am_phone": am_phone, "am_email": am_email,
+        "quote_date": quote_date, "total_material": total_material, "total_labour": total_labour,
+        "additional_total": add_total, "grand_total": grand_total,
+        "man_days_available": total_labour / 350 if total_labour > 0 else 0.0,
+        "paint_sections": st.session_state.paint_sections.copy(),
+        "additional_sections": st.session_state.additional_sections.copy(),
+        "snapshot_id": _snap,
+    })
+
+# ====================== TAB 2: JOB SPEC & SITE MAN-DAYS ======================
+with tab2:
+    st.subheader("Job Spec & Site Man-Days")
+
+    data = st.session_state.get("tab1_data", {})
+    job_no = data.get("job_no", "Unknown")
+    client = data.get("client", "")
+    client_phone = data.get("client_phone", "")
+    client_email = data.get("client_email", "")
+    client_address = data.get("client_address", "")
+    area_manager = data.get("area_manager", "")
+    am_phone = data.get("am_phone", "")
+    am_email = data.get("am_email", "")
+    man_days_from_tab1 = float(data.get("man_days_available", 0) or 0)
+
+    # Top client info (matches app display)
+    st.markdown(f"""
+    <div style="text-align:right;"><b>Job Number:</b> <code>{job_no}</code></div>
+    <div><b>Client:</b> {client}&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>Phone:</b> {client_phone}&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>Email:<b></b> {client_email}&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>Address:</b> {client_address}&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<b>Area Manager:</b> {area_manager}</div>
+    """, unsafe_allow_html=True)
+    st.caption("All information pulled live from Tab 1 Quote Breakdown")
+
+    _iu = st.session_state.get("ITEM_UNITS", {})
+    _row_fp = _tab2_rows_fingerprint(data.get("paint_sections", []))
+
+    if st.button("🔄 Pull latest from Tab 1", key="tab2_pull_desc_unique"):
+        fresh = _tab2_spec_df_from_paint_sections(data.get("paint_sections", []), _iu)
+        st.session_state.tab2_spec_df = fresh
+        st.session_state.tab2_last_row_fingerprint = _row_fp
+        if "tab2_editor_df" in st.session_state:
+            del st.session_state["tab2_editor_df"]
+        st.rerun()
+
+    if "tab2_spec_df" not in st.session_state:
+        st.session_state.tab2_spec_df = _tab2_spec_df_from_paint_sections(data.get("paint_sections", []), _iu)
+        st.session_state.tab2_last_row_fingerprint = _row_fp
+
+    # Build dataframe (keep user edits; only refresh MD from Tab 1)
+    df = st.session_state.tab2_spec_df.copy()
+    paint_sections = data.get("paint_sections", [])
+
+    if not df.empty:
+        flat_paint = _flatten_paint_sections(paint_sections)
+        if len(flat_paint) == len(df):
+            man_days_list = []
+            for i, row in df.iterrows():
+                sec = flat_paint[i]
+                cls = sec.get('paint_class', 'A')
+                item = sec.get('item', 'Walls')
+                method = sec.get('method', 'Previously painted')
+                area = float(sec.get('area_m2', 0))
+
+                mult = {'A': 1.0, 'B': 1.15, 'C': 1.25}.get(cls, 1.0)
+                item_rates = st.session_state.get("ITEM_RATES", {}).get(item, {'labour': 47})
+                base_labour = item_rates.get('labour', 47) * mult
+                labour_total = area * base_labour
+                man_days = round(labour_total / 350, 2) if labour_total > 0 else 0.0
+                man_days_list.append(man_days)
+
+            df["MD /Section"] = man_days_list
+            st.session_state.tab2_spec_df["MD /Section"] = man_days_list
+
+    # Migrate legacy column names from older session state
+    if "Area Description - Internal/External" in df.columns and "Area Description" not in df.columns:
+        df = df.rename(columns={"Area Description - Internal/External": "Area Description"})
+    if "Quote Area" in df.columns and "Area Description" not in df.columns:
+        df = df.rename(columns={"Quote Area": "Area Description"})
+    if "Job Note" in df.columns and "Job Notes" not in df.columns:
+        df = df.rename(columns={"Job Note": "Job Notes"})
+    if "Section" in df.columns:
+        df["Section"] = df["Section"].astype(str).str.replace(r"^Section\s+", "", regex=True)
+
+    # Ensure UI column order keeps MD next to Quantity (Job Notes merged into PDF area column)
+    preferred_order = [
+        "Section",
+        "Area Description",
+        "Unit",
+        "Quantity",
+        "MD /Section",
+        "Job Notes",
+        "Notes",
+    ]
+    ordered_existing = [c for c in preferred_order if c in df.columns]
+    remaining = [c for c in df.columns if c not in ordered_existing]
+    df = df[ordered_existing + remaining]
+
+    st.caption("Job notes are edited on Tab 1; they appear under each area in the editor and as numbered steps on the PDF.")
+
+    area_only = df["Area Description"].copy()
+    job_notes_col = df["Job Notes"].copy() if "Job Notes" in df.columns else pd.Series([""] * len(df), index=df.index)
+    df_show = df.copy()
+    df_show["Area Description"] = [
+        _tab2_area_display_text(a, n) for a, n in zip(area_only, job_notes_col)
+    ]
+
+    @st.fragment
+    def _tab2_spec_table_fragment():
+        if "tab2_editor_df" not in st.session_state or len(st.session_state.tab2_editor_df) != len(df_show):
+            st.session_state.tab2_editor_df = df_show.copy().reset_index(drop=True)
+        else:
+            view = st.session_state.tab2_editor_df
+            for col in ("Section", "Area Description", "MD /Section"):
+                if col in df_show.columns and col in view.columns:
+                    view[col] = df_show[col].values
+            st.session_state.tab2_editor_df = view
+
+        st.session_state.tab2_editor_df = st.data_editor(
+            st.session_state.tab2_editor_df,
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            column_order=(
+                "Section",
+                "Area Description",
+                "Unit",
+                "Quantity",
+                "MD /Section",
+                "Notes",
+            ),
+            column_config={
+                "Section": st.column_config.TextColumn("Nr", disabled=True, width=48),
+                "Area Description": st.column_config.TextColumn(
+                    "Area Description", disabled=True, width="medium"
+                ),
+                "Unit": st.column_config.SelectboxColumn(
+                    "Unit", options=["m²", "lm", "each", "sum"], width="small"
+                ),
+                "Quantity": st.column_config.NumberColumn("Quantity", format="%.2f", width="small"),
+                "MD /Section": st.column_config.NumberColumn("MD", format="%.2f", disabled=True, width=68),
+                "Notes": st.column_config.TextColumn("Notes", width="medium"),
+            },
+        )
+        st.session_state.tab2_spec_df = _apply_tab2_editor_edits(
+            st.session_state.tab2_spec_df,
+            st.session_state.tab2_editor_df,
+            area_only,
+            job_notes_col,
+        )
+
+    _tab2_spec_table_fragment()
+    edited_spec = st.session_state.tab2_spec_df
+
+    st.success(f"**Total Man Days Allowed (from Tab 1):** {man_days_from_tab1:.2f} days")
+
+    spec_sections = _tab2_job_spec_sections(paint_sections, edited_spec)
+
+    # ONE SINGLE PDF DOWNLOAD BUTTON (PDF only - no extra steps)
+    if st.button("📄 Download Job Spec PDF (with Letterhead)", type="primary", use_container_width=True):
+        pdf_buffer = generate_letterhead_pdf(
+            tab_title="Job Spec & Site Man-Days",
+            job_no=job_no,
+            client=client,
+            client_info={
+                "phone": client_phone,
+                "email": client_email,
+                "address": client_address,
+                "area_manager": area_manager,
+                "am_phone": am_phone,
+                "am_email": am_email,
+            },
+            job_spec_sections=spec_sections,
+            total_man_days=man_days_from_tab1,
+            force_portrait=True
+        )
+        if pdf_buffer:
+            st.download_button(
+                "✅ Download Job Spec PDF (Letterhead)",
+                data=pdf_buffer.getvalue(),
+                file_name=_download_filename(job_no, client, "pdf", tab_number=2),
+                mime="application/pdf",
+                use_container_width=True
+            )
+
+# ====================== TAB 3: ATTENDANCE & BONUS ======================
+with tab3:
+    st.header("3. Attendance & Bonus")
+    st.subheader("Site Attendance Sheet")
+
+    data = st.session_state.get("tab1_data", {})
+    job_no = data.get("job_no", "—")
+    client = data.get("client", "")
+    client_address = data.get("client_address", "")
+
+    # ========== UPDATED TOP ROW: Client info (left) + Completed date + Signature (right) ==========
+    top_left, top_right = st.columns([5.5, 3.5])
+    
+    with top_left:
+        c1, c2, c3 = st.columns([2.2, 1.3, 2.5])
+        with c1:
+            st.text_input("Client", value=client, disabled=True, key="t3_client")
+        with c2:
+            st.text_input("Job", value=job_no, disabled=True, key="t3_job")
+        with c3:
+            st.text_input("Address", value=client_address, disabled=True, key="t3_address")
+
+    with top_right:
+        st.markdown("**Completed Date & Signature**", help="Complete after site work is finished")
+        sig_col1, sig_col2 = st.columns(2)
+        with sig_col1:
+            completed_date = st.date_input(
+                "Completed Date", 
+                value=date.today(), 
+                key="t3_completed_date",
+                label_visibility="collapsed"
+            )
+        with sig_col2:
+            signature = st.text_input(
+                "Signature", 
+                key="t3_signature",
+                placeholder="Team Leader sign here",
+                label_visibility="collapsed"
+            )
+
+    # Man Days Available (kept as before)
+    colA, colB = st.columns(2)
+    with colA:
+        man_days_available = st.number_input(
+            "Man Days Allowed", 
+            value=float(data.get("man_days_available", 50.0)), 
+            step=0.5, 
+            key="t3_mda"
+        )
+
+    # ==================== 14-ROW ATTENDANCE TABLE (with new R/value column) ====================
+    day_cols = [str(i) for i in range(1, 32)]
+
+    if "attendance_df" not in st.session_state or st.session_state.get("attendance_job") != job_no:
+        init_data = {
+            "Name": [""] * 14,
+            **{day: [None] * 14 for day in day_cols},
+            "Totals": [None] * 14,
+            "R/value": [None] * 14          # NEW COLUMN
+        }
+        st.session_state.attendance_df = pd.DataFrame(init_data)
+        st.session_state.attendance_job = job_no
+
+    @st.fragment
+    def _attendance_table_fragment():
+        edited_df = st.data_editor(
+            st.session_state.attendance_df,
+            num_rows="fixed",
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Name": st.column_config.TextColumn("Name:", width="medium"),
+                **{day: st.column_config.NumberColumn(
+                    day,
+                    min_value=0,
+                    max_value=2,
+                    step=0.5,
+                    format="%.1f",
+                    width="small",
+                ) for day in day_cols},
+                "Totals": st.column_config.NumberColumn("Totals", disabled=True, width="small"),
+                "R/value": st.column_config.NumberColumn(
+                    "R/value", 
+                    disabled=True, 
+                    format="R %.2f", 
+                    width="small"
+                ),
+            },
+            key="attendance_editor"
+        )
+        return edited_df
+
+    edited_df = _attendance_table_fragment()
+    st.session_state.attendance_df = edited_df
+
+    # Calculate Totals + R/value for each row
+    mdr_rate = st.number_input("MDR Rate (R/day)", value=350.0, step=10.0, key="t3_mdr_rate")
+
+    total_man_days_used = 0.0
+    for i in range(len(st.session_state.attendance_df)):
+        numeric_day_values = pd.to_numeric(
+            st.session_state.attendance_df.iloc[i][day_cols], errors="coerce"
+        ).fillna(0)
+        row_total = numeric_day_values.sum()
+        st.session_state.attendance_df.at[i, "Totals"] = round(row_total, 1)
+        st.session_state.attendance_df.at[i, "R/value"] = round(row_total * mdr_rate, 2)
+        total_man_days_used += row_total
+
+    st.metric("**Man Days Total**", f"{total_man_days_used:.2f}")
+
+    # ========== UPDATED BOTTOM SUMMARY BLOCK ==========
+    st.markdown("### Summary & Bonus Calculation")
+
+    bonus_man_days = max(0.0, man_days_available - total_man_days_used)
+    r_value_of_bonus = bonus_man_days * mdr_rate
+    bonus_per_man_day = mdr_rate
+
+    sum_col1, sum_col2, sum_col3, sum_col4, sum_col5 = st.columns(5)
+
+    with sum_col1:
+        st.metric("Man Days Allowed", f"{man_days_available:.1f}")
+    with sum_col2:
+        st.metric("Man Days Total", f"{total_man_days_used:.1f}")
+    with sum_col3:
+        st.metric("Bonus Man Days", f"{bonus_man_days:.1f}")
+    with sum_col4:
+        st.metric("R value of Bonus", f"R {r_value_of_bonus:,.2f}")
+    with sum_col5:
+        st.metric("Bonus per Man Day", f"R {bonus_per_man_day:,.2f}")
+
+    # ==================== PDF DOWNLOAD ====================
+    if st.button("📄 Generate Attendance PDF", type="primary", use_container_width=True):
+        att_df = st.session_state.attendance_df
+        table_data = [
+            ["Date"] + [""] * 31 + ["", ""],
+            ["Name:"] + [str(i) for i in range(1, 32)] + ["Totals", "R/value"],
+        ]
+        for i in range(14):
+            row = [str(att_df.iloc[i]["Name"] or "")] + [
+                str(att_df.iloc[i][str(d)]) if pd.notna(att_df.iloc[i][str(d)]) else ""
+                for d in range(1, 32)
+            ] + ["", ""]  # Totals and R/value left blank on PDF for manual fill-in
+            table_data.append(row)
+
+        pdf_buffer = generate_letterhead_pdf(
+            tab_title="Attendance",
+            job_no=job_no,
+            client=client,
+            attendance_meta={
+                "client": client,
+                "job_no": job_no,
+                "address": client_address,
+                "man_days_allowed": man_days_available,
+                "man_days_total": total_man_days_used,
+                "bonus_man_days": bonus_man_days,
+                "r_value_of_bonus": r_value_of_bonus,
+                "bonus_per_man_day": bonus_per_man_day,
+                "mdr_rate": mdr_rate,
+                "signature": signature,
+            },
+            table_rows=table_data,
+            force_portrait=False,
+            attendance_table=True,
+            template_candidates=[
+                "attendance_template.docx",
+                "Attendance_template.docx",
+                "ATTENDANCE_TEMPLATE.docx",
+                "template.docx",
+                "Template.docx",
+                "letterhead.docx",
+                "Letterhead.docx",
+            ],
+        )
+
+        if pdf_buffer:
+            st.session_state["attendance_pdf_bytes"] = pdf_buffer.getvalue()
+            st.success("Attendance PDF generated. Click download below.")
+
+    if st.session_state.get("attendance_pdf_bytes"):
+        st.download_button(
+            label="⬇️ Download Attendance.pdf",
+            data=st.session_state["attendance_pdf_bytes"],
+            file_name=_download_filename(job_no, client, "pdf", tab_number=3),
+            mime="application/pdf",
+            use_container_width=True
+        )
+# ====================== TAB 4: EMPLOYMENT CONTRACT ======================
+with tab4:
+    st.subheader("Employment Contract Generator")
+    st.info("Fill in employee details below, then download a PDF contract.")
+
+    data = st.session_state.get("tab1_data", {})
+    _job_mgr_key = f"{data.get('job_no', '')}|{data.get('area_manager', '')}"
+    if st.session_state.get("_tab4_job_mgr_key") != _job_mgr_key:
+        st.session_state._tab4_job_mgr_key = _job_mgr_key
+        st.session_state.emp_site = str(data.get("job_no", "") or "")
+        st.session_state.emp_mgr = str(data.get("area_manager", "") or "")
+    elif "emp_site" not in st.session_state:
+        st.session_state.emp_site = str(data.get("job_no", "") or "")
+        st.session_state.emp_mgr = str(data.get("area_manager", "") or "")
+    st.caption(f"Tab 1: **{data.get('job_no', '—')}** — {data.get('client', '')}")
+
+    ec1, ec2 = st.columns(2)
+    with ec1:
+        emp_name = st.text_input("Employee Full Name", "", key="emp_name")
+        emp_id = st.text_input("SA ID / Passport No", "", key="emp_id")
+        emp_role = st.selectbox("Role", ["Painter", "Team Leader", "Assistant", "Labourer", "Other"], key="emp_role")
+        emp_rate = st.number_input("Daily Rate (R)", value=350.0, step=10.0, key="emp_rate")
+    with ec2:
+        emp_start = st.date_input("Contract Start Date", date.today(), key="emp_start")
+        emp_end = st.date_input("Contract End Date", date.today(), key="emp_end")
+        emp_site = st.text_input("Site / Job Name", key="emp_site")
+        emp_manager = st.text_input("Supervisor / Manager", key="emp_mgr")
+
+    contract_text = f"""
+EMPLOYMENT CONTRACT – PRO PAINT TEAMS
+
+Employee: {emp_name}
+ID/Passport: {emp_id}
+Role: {emp_role}
+Daily Rate: R{emp_rate:,.2f}
+
+Site/Job: {emp_site}
+Contract Period: {emp_start} to {emp_end}
+Supervisor: {emp_manager}
+
+TERMS AND CONDITIONS:
+1. The employee agrees to perform all duties related to the role of {emp_role}.
+2. Working hours: 07:00 – 16:30 (Mon–Fri), with a 30-minute lunch break.
+3. The employee will be paid at the agreed daily rate for each day worked.
+4. PPE must be worn at all times on site.
+5. The employee must follow all health and safety regulations.
+6. Either party may terminate this contract with 1 day written notice.
+7. Tools and materials remain the property of Pro Paint Teams.
+8. Bonus payments are discretionary and based on Man-Days saved.
+
+Signed (Employee): ____________________________  Date: ____________
+
+Signed (Manager):  ____________________________  Date: ____________
+"""
+    st.text_area("Contract Preview", contract_text, height=400, disabled=True)
+
+    contract_lines = [line.strip() for line in contract_text.strip().split("\n") if line.strip()]
+    pdf_buffer = generate_letterhead_pdf(
+        "Employment Contract",
+        data.get("job_no", ""),
+        data.get("client", ""),
+        content_lines=contract_lines
+    )
+    if pdf_buffer:
+        st.download_button(
+            "📄 Download Employment Contract PDF",
+            data=pdf_buffer.getvalue(),
+            file_name=_download_filename(
+                data.get("job_no", ""), data.get("client", ""), "pdf", tab_number=4
+            ),
+            mime="application/pdf",
+            use_container_width=True,
+            type="primary"
+        )
+
+# ====================== TAB 5: DASHBOARD ======================
+with tab5:
+    st.subheader("Job Dashboard")
+
+    data = st.session_state.get("tab1_data", {})
+    man_days_available = float(data.get("man_days_available", 0) or 0)
+    paint_sections = data.get("paint_sections", [])
+    flat_paint_sections = _flatten_paint_sections(paint_sections)
+    has_line_items = any(float(s.get("area_m2", 0) or 0) > 0 for s in flat_paint_sections)
+
+    st.info(
+        f"**Tab 1** — Job: **{data.get('job_no', '—')}** | Client: **{data.get('client', '')}** | "
+        f"Materials: **R{float(data.get('total_material', 0) or 0):,.2f}** | Labour: **R{float(data.get('total_labour', 0) or 0):,.2f}** | "
+        f"Grand total: **R{float(data.get('grand_total', 0) or 0):,.2f}**"
+    )
+
+    if not paint_sections or not has_line_items:
+        st.warning("Add at least one paint section with a quantity greater than zero on Tab 1.")
+    else:
+        df_spec_dash = pd.DataFrame([
+            {
+                "Quote Area": sec.get("item", "Unknown"),
+                "Quantity": float(sec.get("area_m2", 0)),
+                "Allowed Man-Days": (float(sec.get("area_m2", 0)) / 30)
+            } for sec in flat_paint_sections if float(sec.get("area_m2", 0)) > 0
+        ])
+
+        d1, d2, d3 = st.columns(3)
+        with d1: st.metric("Man-days (Tab 1 labour ÷ 350)", f"{man_days_available:.2f}")
+        with d2:
+            total_qty = df_spec_dash["Quantity"].sum()
+            st.metric("Total quoted quantity (sum of units)", f"{total_qty:,.0f}")
+        with d3: st.metric("Line items", f"{len(df_spec_dash)}")
+
+        if not df_spec_dash.empty:
+            fig_bar = px.bar(df_spec_dash, x="Quote Area", y="Allowed Man-Days", title="Allowed Man-Days per Area", color="Allowed Man-Days", color_continuous_scale="Blues")
+            fig_bar.update_layout(xaxis_tickangle=-45)
+            st.plotly_chart(fig_bar, use_container_width=True, key="dash_bar_chart")
+
+            fig_pie = px.pie(df_spec_dash, names="Quote Area", values="Allowed Man-Days", title="Man-Day Distribution by Area")
+            st.plotly_chart(fig_pie, use_container_width=True, key="dash_pie_chart")
+
+            fig_qty = px.bar(df_spec_dash, x="Quote Area", y="Quantity", title="Quantity per Area", color="Quote Area")
+            fig_qty.update_layout(xaxis_tickangle=-45, showlegend=False)
+            st.plotly_chart(fig_qty, use_container_width=True, key="dash_qty_chart")
+
+        dash_rows = [["Quote Area", "Quantity", "Allowed Man-Days"]]
+        for _, r in df_spec_dash.iterrows():
+            dash_rows.append([str(r.get("Quote Area", "")), f"{r.get('Quantity', 0):.1f}", f"{r.get('Allowed Man-Days', 0):.2f}"])
+        content_lines = [
+            f"Materials: R{data.get('total_material', 0):,.2f}",
+            f"Labour: R{data.get('total_labour', 0):,.2f}",
+            f"Grand Total: R{data.get('grand_total', 0):,.2f}",
+            f"Man-days Available: {float(data.get('man_days_available', 0)):.2f}"
+        ]
+        pdf_buffer = generate_letterhead_pdf(
+            "Job Dashboard Summary",
+            data.get("job_no", ""),
+            data.get("client", ""),
+            content_lines,
+            table_rows=dash_rows
+        )
+        if pdf_buffer:
+            st.download_button(
+                "📄 Download Dashboard Summary PDF",
+                data=pdf_buffer.getvalue(),
+                file_name=_download_filename(
+                    data.get("job_no", ""), data.get("client", ""), "pdf", extra_suffix="Dashboard"
+                ),
+                mime="application/pdf",
+                use_container_width=True,
+                type="primary"
+            )

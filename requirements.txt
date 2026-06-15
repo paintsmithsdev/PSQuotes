@@ -1,0 +1,8 @@
+streamlit>=1.48.0
+pandas
+plotly
+reportlab
+docxtpl
+pywin32
+gspread
+google-auth
