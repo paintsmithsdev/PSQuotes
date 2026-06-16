@@ -241,14 +241,51 @@ def _upsert_by_key(name: str, key_field: str, key_value: str, row: dict) -> None
         key_idx = headers.index(key_field)
 
     row_values = [str(row.get(h, "") or "") for h in headers]
-    key_value = str(key_value)
+    key_value = str(key_value).strip()
 
     for row_num, existing in enumerate(values[1:], start=2):
-        if len(existing) > key_idx and str(existing[key_idx]) == key_value:
+        if len(existing) > key_idx and str(existing[key_idx]).strip() == key_value:
             _retry_on_quota(ws.update, [row_values], f"A{row_num}")
             return
 
     _retry_on_quota(ws.append_row, row_values, value_input_option="USER_ENTERED")
+
+
+def _update_row_fields(name: str, key_field: str, key_value: str, fields: dict) -> bool:
+    """Find a row by key and update only the supplied fields in-place.
+
+    Returns True if the row was found and updated, False if not found.
+    Unlike _upsert_by_key this never appends a new row.
+    """
+    ws = _worksheet(name)
+    headers = SHEET_HEADERS[name]
+    values = _retry_on_quota(ws.get_all_values)
+    if not values:
+        return False
+
+    header_row = values[0]
+    try:
+        key_idx = header_row.index(key_field)
+    except ValueError:
+        try:
+            key_idx = headers.index(key_field)
+        except ValueError:
+            return False
+
+    key_value = str(key_value).strip()
+
+    for row_num, existing in enumerate(values[1:], start=2):
+        if len(existing) > key_idx and str(existing[key_idx]).strip() == key_value:
+            # Build updated row: start from existing values, overlay changed fields
+            existing_padded = list(existing) + [""] * max(0, len(headers) - len(existing))
+            updated = list(existing_padded[:len(headers)])
+            for field, value in fields.items():
+                if field in headers:
+                    updated[headers.index(field)] = str(value) if value is not None else ""
+            _retry_on_quota(ws.update, [updated], f"A{row_num}")
+            return True
+
+    return False
 
 
 def _replace_sheet(name: str, rows: list[dict]) -> None:
@@ -315,6 +352,30 @@ def save_job(
             "date_created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         },
     )
+
+
+def update_job_fields(job_no: str, fields: dict) -> bool:
+    """Update specific fields of an existing job without touching the rest.
+
+    Fields that are NOT in `fields` (e.g. total_labour, date_created) are
+    left exactly as they are in the sheet.  Never creates a new row.
+    Returns True if the job was found and updated.
+    """
+    if not is_configured():
+        raise RuntimeError("Google Sheets is not configured")
+    return _update_row_fields("Jobs", "job_no", str(job_no), fields)
+
+
+def update_client_fields(original_name: str, fields: dict) -> bool:
+    """Update specific fields of an existing client record.
+
+    Looks up the client by `original_name` so renaming the client works
+    correctly (the old row is updated rather than a new one appended).
+    Never creates a new row.  Returns True if the client was found.
+    """
+    if not is_configured():
+        raise RuntimeError("Google Sheets is not configured")
+    return _update_row_fields("Clients", "client", original_name, fields)
 
 
 def get_all_jobs():

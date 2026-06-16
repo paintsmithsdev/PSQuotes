@@ -11,17 +11,135 @@ from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
 from datetime import date
 from io import BytesIO
+from urllib.parse import quote as _url_quote
+import secrets
+import time
 
 import db_sheets
 from pdf_linux import generate_letterhead_pdf, generate_quote_pdf
 
 st.set_page_config(page_title="Pro Paint Teams Job/Site Worksheet", layout="wide")
 
+# ---- One-time auth-token store (for new-tab quote links) ----
+# Uses st.cache_resource so the dict is a true singleton that survives
+# Streamlit script reruns (module-level dicts get reset on every rerun).
+_AUTH_TOKEN_TTL = 3600  # seconds (1 hour)
+
+# ---- Persistent session-token store (for page reload auth) ----
+_SESSION_TOKEN_TTL = 8 * 3600  # 8 hours in seconds
+
+
+@st.cache_resource
+def _get_auth_token_store() -> dict:
+    """Singleton dict: token -> (expiry_monotonic, quote_no). Persists across reruns."""
+    return {}
+
+
+@st.cache_resource
+def _get_session_store() -> dict:
+    """Singleton dict: session_token -> expiry_monotonic. Persists across reruns."""
+    return {}
+
+
+def _create_auth_token(job_no: str) -> str:
+    """Mint a one-time token that grants full auth + opens a specific quote."""
+    store = _get_auth_token_store()
+    _prune_auth_tokens(store)
+    token = secrets.token_urlsafe(32)
+    store[token] = (time.monotonic() + _AUTH_TOKEN_TTL, str(job_no))
+    return token
+
+
+def _redeem_auth_token(token: str) -> str | None:
+    """Validate a token. Returns quote_no on success, None if invalid/expired.
+    Token stays valid until its TTL expires so refreshing the tab keeps working."""
+    store = _get_auth_token_store()
+    _prune_auth_tokens(store)
+    entry = store.get(token)
+    if entry and entry[0] > time.monotonic():
+        return entry[1]
+    return None
+
+
+def _prune_auth_tokens(store: dict | None = None) -> None:
+    if store is None:
+        store = _get_auth_token_store()
+    now = time.monotonic()
+    expired = [k for k, (exp, _) in list(store.items()) if exp <= now]
+    for k in expired:
+        del store[k]
+
+
+def _create_session_token() -> str:
+    """Mint a long-lived session token and add it to the URL so page reloads
+    don't prompt for the password again."""
+    store = _get_session_store()
+    _prune_session_tokens(store)
+    token = secrets.token_urlsafe(32)
+    store[token] = time.monotonic() + _SESSION_TOKEN_TTL
+    return token
+
+
+def _validate_session_token(token: str) -> bool:
+    """Return True if token exists and has not expired."""
+    store = _get_session_store()
+    exp = store.get(token)
+    if not exp:
+        return False
+    if time.monotonic() > exp:
+        del store[token]
+        return False
+    return True
+
+
+def _prune_session_tokens(store: dict | None = None) -> None:
+    if store is None:
+        store = _get_session_store()
+    now = time.monotonic()
+    expired = [k for k, exp in list(store.items()) if exp <= now]
+    for k in expired:
+        del store[k]
+
 
 def _require_app_password():
-    """Block the app until the user enters the password from Streamlit secrets."""
+    """Block the app until the user enters the password from Streamlit secrets.
+
+    Supports three silent-auth paths that skip the password form:
+      1. ?auth_token=  – short-lived token for new-tab quote links.
+      2. ?session=     – long-lived (8 h) token written to the URL after login,
+                         so hard page reloads don't re-prompt.
+      3. session_state – already authenticated in this Streamlit session.
+    """
+    # --- 1. quote auth_token (new-tab flow) ---
+    raw_token = (st.query_params.get("auth_token") or "").strip()
+    if raw_token and not st.session_state.get("password_authenticated"):
+        quote_no = _redeem_auth_token(raw_token)
+        if quote_no:
+            st.session_state.password_authenticated = True
+            st.session_state["_standalone_quote"] = quote_no
+            # Fall through — standalone page block intercepts before st.tabs.
+        else:
+            st.error("This link has expired or is invalid. Please ask for a new one.")
+            st.stop()
+
+    # --- 2. persistent session token (page-reload flow) ---
+    raw_session = (st.query_params.get("session") or "").strip()
+    if raw_session and not st.session_state.get("password_authenticated"):
+        if _validate_session_token(raw_session):
+            st.session_state.password_authenticated = True
+        else:
+            # Token expired — remove it from the URL silently, then fall
+            # through to show the password form.
+            try:
+                del st.query_params["session"]
+            except Exception:
+                pass
+
+    # --- 3. already authenticated this session ---
     if st.session_state.get("password_authenticated"):
         return
+
+    # --- password form ---
     try:
         correct_password = str(st.secrets["password"])
     except (KeyError, FileNotFoundError, AttributeError):
@@ -34,6 +152,10 @@ def _require_app_password():
         if st.form_submit_button("Enter"):
             if entered == correct_password:
                 st.session_state.password_authenticated = True
+                # Write a session token to the URL so the next reload skips
+                # the password form for up to 8 hours.
+                sess_token = _create_session_token()
+                st.query_params["session"] = sess_token
                 st.rerun()
             else:
                 st.error("Incorrect password.")
@@ -41,6 +163,252 @@ def _require_app_password():
 
 
 _require_app_password()
+
+# ---- Standalone quote details page (new-tab auth flow) ----
+_standalone_quote = st.session_state.get("_standalone_quote", "")
+if _standalone_quote:
+    _sa_db_ready = False
+    try:
+        _sa_db_ready = db_sheets.is_configured()
+    except Exception:
+        pass
+
+    if not _sa_db_ready:
+        st.title(f"Quote Details — {_standalone_quote}")
+        st.caption("Pro Paint Teams · authenticated session")
+        st.error("Database not configured — cannot load quote details.")
+    else:
+        try:
+            _sa_history = db_sheets.get_job_history()
+        except Exception as _e:
+            _sa_history = pd.DataFrame()
+
+        if _sa_history.empty:
+            st.title(f"Quote Details — {_standalone_quote}")
+            st.warning("No saved quotes found.")
+        else:
+            if "job_no" in _sa_history.columns:
+                _sa_history["Quote #"] = _sa_history["job_no"].astype(str)
+            _sa_needle = str(_standalone_quote).strip().lower()
+            _sa_matches = _sa_history[
+                _sa_history["Quote #"].astype(str).str.lower() == _sa_needle
+            ]
+            if _sa_matches.empty:
+                st.title(f"Quote Details — {_standalone_quote}")
+                st.warning(f"Quote **{_standalone_quote}** was not found in the database.")
+            else:
+                _sa_row = _sa_matches.iloc[0]
+                _sa_editing = st.session_state.get("_sa_editing", False)
+                _sa_loading = (
+                    st.session_state.get("_sa_saving", False)
+                    or st.session_state.get("_sa_cancelling", False)
+                )
+
+                # ---- Header row: title on left, action buttons on right ----
+                _sa_hdr_l, _sa_hdr_r = st.columns([5, 1])
+                with _sa_hdr_l:
+                    st.title(f"Quote Details — {_standalone_quote}")
+                    st.caption("Pro Paint Teams · authenticated session")
+                with _sa_hdr_r:
+                    st.write("")  # vertical alignment spacer
+                    if not _sa_editing:
+                        if st.button("✏️ Edit", key="sa_pencil_btn", type="secondary",
+                                     use_container_width=True, disabled=_sa_loading):
+                            st.session_state["_sa_editing"] = True
+                            st.rerun()
+                    else:
+                        if st.button("✕ Cancel", key="sa_cancel_btn", type="secondary",
+                                     use_container_width=True, disabled=_sa_loading):
+                            st.session_state["_sa_cancelling"] = True
+                            st.rerun()
+
+                st.divider()
+
+                _sa_qdate = pd.to_datetime(_sa_row.get("start_date", ""), errors="coerce")
+                _sa_saved = pd.to_datetime(_sa_row.get("date_created", ""), errors="coerce")
+                try:
+                    _sa_labour = f"R{float(_sa_row.get('total_labour', 0) or 0):,.2f}"
+                except Exception:
+                    _sa_labour = str(_sa_row.get("total_labour", ""))
+                try:
+                    _sa_md = f"{float(_sa_row.get('man_days_available', 0) or 0):.2f}"
+                except Exception:
+                    _sa_md = str(_sa_row.get("man_days_available", ""))
+
+                if not _sa_editing:
+                    # ---- Read-only view ----
+                    _sa_c1, _sa_c2 = st.columns(2)
+                    with _sa_c1:
+                        st.markdown("**Client**");       st.write(str(_sa_row.get("client", "") or "—"))
+                        st.markdown("**Phone**");        st.write(str(_sa_row.get("phone", "") or "—"))
+                        st.markdown("**Email**");        st.write(str(_sa_row.get("email", "") or "—"))
+                        st.markdown("**Address**");      st.write(str(_sa_row.get("address", "") or "—"))
+                        st.markdown("**Area Manager**"); st.write(str(_sa_row.get("area_manager", "") or "—"))
+                    with _sa_c2:
+                        st.markdown("**Quote Date**")
+                        st.write(_sa_qdate.strftime("%Y-%m-%d") if pd.notna(_sa_qdate) else "—")
+                        st.markdown("**Status**");       st.write(str(_sa_row.get("status", "") or "—"))
+                        st.markdown("**Saved At**")
+                        st.write(_sa_saved.strftime("%Y-%m-%d %H:%M") if pd.notna(_sa_saved) else "—")
+                        st.markdown("**Labour Total**"); st.write(_sa_labour)
+                        st.markdown("**Man-Days**");     st.write(_sa_md)
+
+
+                else:
+                    _sa_saving = st.session_state.get("_sa_saving", False)
+                    _sa_cancelling = st.session_state.get("_sa_cancelling", False)
+
+                    # ---- Phase 3: cancel in progress — freeze UI then revert ----
+                    if _sa_cancelling:
+                        _sa_status_opts = ["Open", "Closed", "Pending", "Cancelled"]
+                        _sa_cur_status = str(_sa_row.get("status", "Open") or "Open")
+                        _sa_fc1, _sa_fc2 = st.columns(2)
+                        with _sa_fc1:
+                            st.text_input("Client",       value=str(_sa_row.get("client", "") or ""),       disabled=True)
+                            st.text_input("Phone",        value=str(_sa_row.get("phone", "") or ""),        disabled=True)
+                            st.text_input("Email",        value=str(_sa_row.get("email", "") or ""),        disabled=True)
+                            st.text_input("Address",      value=str(_sa_row.get("address", "") or ""),      disabled=True)
+                            st.text_input("Area Manager", value=str(_sa_row.get("area_manager", "") or ""), disabled=True)
+                        with _sa_fc2:
+                            st.date_input("Quote Date",
+                                          value=_sa_qdate.date() if pd.notna(_sa_qdate) else date.today(),
+                                          disabled=True)
+                            st.selectbox("Status", options=_sa_status_opts,
+                                         index=_sa_status_opts.index(_sa_cur_status)
+                                         if _sa_cur_status in _sa_status_opts else 0,
+                                         disabled=True)
+                            st.markdown("**Saved At**")
+                            st.write(_sa_saved.strftime("%Y-%m-%d %H:%M") if pd.notna(_sa_saved) else "—")
+                            st.markdown("**Labour Total**"); st.write(_sa_labour)
+                            st.markdown("**Man-Days**");     st.write(_sa_md)
+                        with st.spinner("Cancelling…"):
+                            st.session_state["_sa_cancelling"] = False
+                            st.session_state["_sa_editing"] = False
+                            st.rerun()
+
+                    # ---- Phase 2: perform save with spinner, fields disabled ----
+                    elif _sa_saving:
+                        _sa_d = st.session_state.get("_sa_edit_data", {})
+                        _sa_status_opts = ["Open", "Closed", "Pending", "Cancelled"]
+                        _sa_fc1, _sa_fc2 = st.columns(2)
+                        with _sa_fc1:
+                            st.text_input("Client",       value=_sa_d.get("client", ""),   disabled=True)
+                            st.text_input("Phone",        value=_sa_d.get("phone", ""),    disabled=True)
+                            st.text_input("Email",        value=_sa_d.get("email", ""),    disabled=True)
+                            st.text_input("Address",      value=_sa_d.get("address", ""),  disabled=True)
+                            st.text_input("Area Manager", value=_sa_d.get("area_manager", ""), disabled=True)
+                        with _sa_fc2:
+                            st.date_input("Quote Date", value=_sa_d.get("quote_date", date.today()), disabled=True)
+                            st.selectbox("Status", options=_sa_status_opts,
+                                         index=_sa_status_opts.index(_sa_d.get("status", "Open"))
+                                         if _sa_d.get("status") in _sa_status_opts else 0,
+                                         disabled=True)
+                            st.markdown("**Saved At**")
+                            st.write(_sa_saved.strftime("%Y-%m-%d %H:%M") if pd.notna(_sa_saved) else "—")
+                            st.markdown("**Labour Total**"); st.write(_sa_labour)
+                            st.markdown("**Man-Days**");     st.write(_sa_md)
+
+                        st.divider()
+                        with st.spinner("Saving changes…"):
+                            try:
+                                _sa_job_no = str(_sa_row.get("job_no", "") or "")
+
+                                # Upsert the client by name (creates if new, updates if exists).
+                                db_sheets.save_client(
+                                    _sa_d["client"], _sa_d["phone"],
+                                    _sa_d["email"], _sa_d["address"])
+
+                                # Update only the editable job fields — leave
+                                # total_labour, man_days_available, date_created etc. untouched.
+                                db_sheets.update_job_fields(
+                                    _sa_job_no,
+                                    {
+                                        "job_name":     _sa_d["client"],
+                                        "client":       _sa_d["client"],
+                                        "area_manager": _sa_d["area_manager"],
+                                        "start_date":   str(_sa_d["quote_date"]),
+                                        "status":       _sa_d["status"],
+                                    },
+                                )
+
+                                st.cache_data.clear()
+                                st.session_state["_sa_saving"] = False
+                                st.session_state["_sa_editing"] = False
+                                st.session_state["_standalone_quote"] = _sa_job_no
+                                st.rerun()
+                            except Exception as _sa_err:
+                                st.session_state["_sa_saving"] = False
+                                st.error(f"Save failed: {_sa_err}")
+
+                    else:
+                        # ---- Phase 1: editable form ----
+                        # (only reached when neither saving nor cancelling)
+                        _sa_status_opts = ["Open", "Closed", "Pending", "Cancelled"]
+                        _sa_cur_status = str(_sa_row.get("status", "Open") or "Open")
+
+                        # Callbacks fire BEFORE the rerun, so the loading phase
+                        # renders immediately on the very next pass — no editable
+                        # flash in between.
+                        def _sa_on_save():
+                            st.session_state["_sa_saving"] = True
+                            st.session_state["_sa_edit_data"] = {
+                                "client":       st.session_state.get("_sa_f_client", ""),
+                                "phone":        st.session_state.get("_sa_f_phone", ""),
+                                "email":        st.session_state.get("_sa_f_email", ""),
+                                "address":      st.session_state.get("_sa_f_address", ""),
+                                "area_manager": st.session_state.get("_sa_f_am", ""),
+                                "quote_date":   st.session_state.get("_sa_f_qdate", date.today()),
+                                "status":       st.session_state.get("_sa_f_status", "Open"),
+                            }
+
+                        def _sa_on_cancel():
+                            st.session_state["_sa_cancelling"] = True
+
+                        with st.form("sa_edit_form"):
+                            _sa_fc1, _sa_fc2 = st.columns(2)
+                            with _sa_fc1:
+                                st.text_input(
+                                    "Client", key="_sa_f_client",
+                                    value=str(_sa_row.get("client", "") or ""))
+                                st.text_input(
+                                    "Phone", key="_sa_f_phone",
+                                    value=str(_sa_row.get("phone", "") or ""))
+                                st.text_input(
+                                    "Email", key="_sa_f_email",
+                                    value=str(_sa_row.get("email", "") or ""))
+                                st.text_input(
+                                    "Address", key="_sa_f_address",
+                                    value=str(_sa_row.get("address", "") or ""))
+                                st.text_input(
+                                    "Area Manager", key="_sa_f_am",
+                                    value=str(_sa_row.get("area_manager", "") or ""))
+                            with _sa_fc2:
+                                st.date_input(
+                                    "Quote Date", key="_sa_f_qdate",
+                                    value=_sa_qdate.date() if pd.notna(_sa_qdate) else date.today())
+                                st.selectbox(
+                                    "Status", key="_sa_f_status",
+                                    options=_sa_status_opts,
+                                    index=_sa_status_opts.index(_sa_cur_status)
+                                    if _sa_cur_status in _sa_status_opts else 0,
+                                )
+                                st.markdown("**Saved At**")
+                                st.write(_sa_saved.strftime("%Y-%m-%d %H:%M") if pd.notna(_sa_saved) else "—")
+                                st.markdown("**Labour Total**"); st.write(_sa_labour)
+                                st.markdown("**Man-Days**");     st.write(_sa_md)
+
+                            st.divider()
+                            _sa_sf1, _sa_sf2 = st.columns(2)
+                            with _sa_sf1:
+                                st.form_submit_button(
+                                    "💾 Save Changes", type="primary",
+                                    use_container_width=True, on_click=_sa_on_save)
+                            with _sa_sf2:
+                                st.form_submit_button(
+                                    "Cancel", type="secondary",
+                                    use_container_width=True, on_click=_sa_on_cancel)
+
+    st.stop()
 
 st.title("Pro Paint Teams Job/Site Worksheet App")
 st.caption("Version 2.8 – Google Sheets + Linux-compatible PDFs")
@@ -134,6 +502,132 @@ def _clear_streamlit_widget_key(key: str):
     """Drop a widget key so the next run rebuilds it from session data (after save/cancel)."""
     if key in st.session_state:
         del st.session_state[key]
+
+
+_TAB1_WIDGET_KEYS = (
+    "area_code",
+    "am_name",
+    "am_phone",
+    "am_email",
+    "client_select",
+    "client",
+    "client_phone",
+    "client_email",
+    "client_address",
+    "job_no",
+    "quote_date",
+)
+
+
+def _queue_quote_open(quote_data: dict) -> None:
+    """Stage a saved quote for Tab 1 (applied before Tab 1 widgets on next run)."""
+    st.session_state.pending_quote_open = quote_data
+
+
+def _apply_pending_quote_open() -> bool:
+    """Load a queued quote into Tab 1 session state before widgets are created."""
+    pending = st.session_state.pop("pending_quote_open", None)
+    if not pending:
+        return False
+
+    for key in _TAB1_WIDGET_KEYS:
+        _clear_streamlit_widget_key(key)
+    for key in ("paint_sections", "additional_sections"):
+        _clear_streamlit_widget_key(key)
+
+    st.session_state.job_no = str(pending.get("job_no", "") or "")
+    st.session_state.client = str(pending.get("client", "") or "")
+    st.session_state.client_phone = str(pending.get("phone", "") or "")
+    st.session_state.client_email = str(pending.get("email", "") or "")
+    st.session_state.client_address = str(pending.get("address", "") or "")
+    st.session_state.am_name = str(pending.get("area_manager", "") or "")
+    st.session_state.am_phone = str(pending.get("am_phone", "") or "")
+    st.session_state.am_email = str(pending.get("am_email", "") or "")
+    st.session_state.quote_date = pending.get("quote_date", date.today())
+
+    st.session_state["ppt_nav_tab"] = pending.get(
+        "nav_tab", "1. Quote Breakdown (Start Here)"
+    )
+    return True
+
+
+def _quote_row_value(row, *keys, default=""):
+    for key in keys:
+        if key in row.index:
+            val = row.get(key)
+            if pd.notna(val) and str(val).strip():
+                return val
+    return default
+
+
+def _quote_payload_from_display_row(row) -> dict:
+    """Build quote-details payload from a quotes display or table row."""
+    quote_no = str(_quote_row_value(row, "Quote #", "job_no") or "")
+    quote_date_val = _quote_row_value(row, "Quote Date", "start_date")
+    parsed_date = pd.to_datetime(quote_date_val, errors="coerce")
+    labour_raw = _quote_row_value(row, "Labour Total", "total_labour", default=0)
+    man_days_raw = _quote_row_value(row, "Man-Days", "man_days_available", default=0)
+    try:
+        labour_fmt = f"R{float(labour_raw):,.2f}"
+    except (TypeError, ValueError):
+        labour_fmt = str(labour_raw)
+    try:
+        man_days_fmt = f"{float(man_days_raw):.2f}"
+    except (TypeError, ValueError):
+        man_days_fmt = str(man_days_raw)
+    saved_at = _quote_row_value(row, "Saved At", default="")
+    if not saved_at:
+        saved_at = pd.to_datetime(row.get("date_created", ""), errors="coerce")
+        saved_at = saved_at.strftime("%Y-%m-%d %H:%M") if pd.notna(saved_at) else ""
+    return {
+        "job_no": quote_no,
+        "client": str(_quote_row_value(row, "Client", "client") or ""),
+        "phone": str(_quote_row_value(row, "Phone", "phone") or ""),
+        "email": str(_quote_row_value(row, "Email", "email") or ""),
+        "address": str(_quote_row_value(row, "Address", "address") or ""),
+        "area_manager": str(_quote_row_value(row, "Area Manager", "area_manager") or ""),
+        "quote_date": parsed_date.date() if pd.notna(parsed_date) else date.today(),
+        "status": str(_quote_row_value(row, "Status", "status") or ""),
+        "saved_at": str(saved_at),
+        "labour_total": labour_fmt,
+        "man_days": man_days_fmt,
+    }
+
+
+def _find_quote_display_row(display_df: pd.DataFrame, job_no: str):
+    if display_df.empty or not str(job_no or "").strip():
+        return None
+    df = display_df.copy()
+    if "Quote #" not in df.columns and "job_no" in df.columns:
+        df["Quote #"] = df["job_no"].astype(str)
+    needle = str(job_no).strip().lower()
+    matches = df[df["Quote #"].astype(str).str.lower() == needle]
+    if matches.empty and "job_no" in df.columns:
+        matches = df[df["job_no"].astype(str).str.lower() == needle]
+    return matches.iloc[0] if not matches.empty else None
+
+
+def _quote_details_new_tab_href(job_no: str) -> str:
+    """Generate a one-time authenticated URL that opens the given quote in a new tab."""
+    token = _create_auth_token(str(job_no or "").strip())
+    return f"?auth_token={_url_quote(token, safe='')}"
+
+
+def _clear_quote_url_param() -> None:
+    pass  # URL no longer carries quote identity (token was already consumed on load)
+
+
+def _open_quote_details_from_url(display_df: pd.DataFrame) -> bool:
+    """Open quote details when a pending_url_quote has been set by the token-auth flow."""
+    job_no = st.session_state.pop("_pending_url_quote", None)
+    if not job_no:
+        return False
+    row = _find_quote_display_row(display_df, job_no)
+    if row is None:
+        return False
+    st.session_state.quote_details_open = True
+    st.session_state.quote_details_payload = _quote_payload_from_display_row(row)
+    return True
 
 
 def _apply_tab2_editor_edits(base_df, edited_show, area_only, job_notes_col):
@@ -693,16 +1187,20 @@ def _download_filename(
     return f"{name}.{ext}"
 
 _TAB_LABELS = [
-    "Master Rates",
     "1. Quote Breakdown (Start Here)",
     "2. Job Spec & Site Man-Days",
     "3. Attendance & Bonus",
     "4. Employment Contract",
     "5. Dashboard",
+    "6. Quotes",
+    "Master Rates",
 ]
 
-tab_master, tab_quote, tab2, tab3, tab4, tab5 = st.tabs(
-    _TAB_LABELS, default="1. Quote Breakdown (Start Here)", key="ppt_nav_tab"
+if "ppt_nav_tab" not in st.session_state:
+    st.session_state["ppt_nav_tab"] = "1. Quote Breakdown (Start Here)"
+
+tab_quote, tab2, tab3, tab4, tab5, tab6, tab_master = st.tabs(
+    _TAB_LABELS, key="ppt_nav_tab"
 )
 
 def get_email_config():
@@ -949,6 +1447,9 @@ with tab_master:
 
 # ====================== TAB 1: QUOTE BREAKDOWN ======================
 with tab_quote:
+    if _apply_pending_quote_open():
+        st.success("Quote loaded from saved records.")
+
     st.title("Pro Paint Teams Quote")
 
     # Live rates from Master Rates (single source of truth)
@@ -1060,7 +1561,7 @@ with tab_quote:
     with c_cols[1]:
         client_address = st.text_input("Physical Address", key="client_address")
         job_no = st.text_input("Quote Number", key="job_no")
-        quote_date = st.date_input("Date of Quote", value=date.today(), key="quote_date")
+        quote_date = st.date_input("Date of Quote", key="quote_date")
 
     # Paint Specification Sections
     st.subheader("Paint Specification Sections")
@@ -1917,3 +2418,256 @@ with tab5:
                 width="stretch",
                 type="primary"
             )
+
+# ====================== TAB 6: QUOTES ======================
+with tab6:
+    _t6_hdr, _t6_btn, _t6_spacer = st.columns([3, 1, 6])
+    with _t6_hdr:
+        st.subheader("Saved Quotes")
+    with _t6_btn:
+        st.write("")  # vertical alignment spacer
+        if st.button("🔄 Refetch", key="quotes_refetch_btn",
+                     type="secondary", use_container_width=True):
+            _cached_job_history.clear()
+            st.rerun()
+
+    if not DB_READY:
+        st.warning("Google Sheets is not configured, so saved quotes cannot be loaded.")
+    else:
+        try:
+            quotes_df = _cached_job_history()
+        except Exception as e:
+            st.error(f"Could not load saved quotes: {e}")
+            quotes_df = pd.DataFrame()
+
+        if quotes_df.empty:
+            st.info("No saved quotes found yet. Save a quote on Tab 1 to see it here.")
+        else:
+            display_df = quotes_df.copy()
+
+            if "job_no" in display_df.columns:
+                display_df["Quote #"] = display_df["job_no"].astype(str)
+            else:
+                display_df["Quote #"] = ""
+
+            if "date_created" in display_df.columns:
+                display_df["Saved At"] = pd.to_datetime(
+                    display_df["date_created"], errors="coerce"
+                ).dt.strftime("%Y-%m-%d %H:%M")
+                display_df["Saved At"] = display_df["Saved At"].fillna("")
+            else:
+                display_df["Saved At"] = ""
+
+            if "total_labour" in display_df.columns:
+                display_df["Labour Total"] = pd.to_numeric(
+                    display_df["total_labour"], errors="coerce"
+                ).fillna(0.0)
+            else:
+                display_df["Labour Total"] = 0.0
+
+            if "man_days_available" in display_df.columns:
+                display_df["Man-Days"] = pd.to_numeric(
+                    display_df["man_days_available"], errors="coerce"
+                ).fillna(0.0)
+            else:
+                display_df["Man-Days"] = 0.0
+
+            if "start_date" in display_df.columns:
+                display_df["Quote Date"] = pd.to_datetime(
+                    display_df["start_date"], errors="coerce"
+                ).dt.strftime("%Y-%m-%d")
+                display_df["Quote Date"] = display_df["Quote Date"].fillna("")
+            else:
+                display_df["Quote Date"] = ""
+
+            for col in ["client", "phone", "email", "address", "area_manager", "status"]:
+                if col not in display_df.columns:
+                    display_df[col] = ""
+
+
+            # ---------- Filters ----------
+            f1, f2, f3 = st.columns(3)
+            with f1:
+                search_text = st.text_input(
+                    "Search (Quote # / Client / Email)",
+                    value="",
+                    key="quotes_search_text",
+                    placeholder="Type quote number, client, or email",
+                ).strip()
+            with f2:
+                status_options = ["All"] + sorted(
+                    [s for s in display_df["status"].astype(str).fillna("").unique().tolist() if s]
+                )
+                status_filter = st.selectbox(
+                    "Status filter",
+                    options=status_options if status_options else ["All"],
+                    index=0,
+                    key="quotes_status_filter",
+                )
+            with f3:
+                client_list = sorted(
+                    [c for c in display_df["client"].astype(str).fillna("").unique().tolist() if c]
+                )
+                client_filter = st.selectbox(
+                    "Client filter",
+                    options=["All"] + client_list,
+                    index=0,
+                    key="quotes_client_filter",
+                )
+
+            filtered_df = display_df.copy()
+            if search_text:
+                query = search_text.lower()
+                search_mask = (
+                    filtered_df["Quote #"].astype(str).str.lower().str.contains(query, na=False)
+                    | filtered_df["client"].astype(str).str.lower().str.contains(query, na=False)
+                    | filtered_df["email"].astype(str).str.lower().str.contains(query, na=False)
+                )
+                filtered_df = filtered_df[search_mask]
+            if status_filter != "All":
+                filtered_df = filtered_df[
+                    filtered_df["status"].astype(str).str.lower()
+                    == str(status_filter).strip().lower()
+                ]
+            if client_filter != "All":
+                filtered_df = filtered_df[
+                    filtered_df["client"].astype(str).str.lower()
+                    == str(client_filter).strip().lower()
+                ]
+
+            table_df = filtered_df[
+                [
+                    "Quote #",
+                    "client",
+                    "phone",
+                    "email",
+                    "address",
+                    "area_manager",
+                    "Quote Date",
+                    "Labour Total",
+                    "Man-Days",
+                    "status",
+                    "Saved At",
+                ]
+            ].rename(
+                columns={
+                    "client": "Client",
+                    "phone": "Phone",
+                    "email": "Email",
+                    "address": "Address",
+                    "area_manager": "Area Manager",
+                    "status": "Status",
+                }
+            )
+
+            table_df = table_df.sort_values(
+                by=["Saved At", "Quote #"], ascending=[False, False], na_position="last"
+            ).reset_index(drop=True)
+            table_df.insert(0, "Row", range(1, len(table_df) + 1))
+            table_df["Labour Total"] = table_df["Labour Total"].map(lambda x: f"R{x:,.2f}")
+            table_df["Man-Days"] = table_df["Man-Days"].map(lambda x: f"{x:.2f}")
+
+            csv_df = display_df.copy()
+            csv_df = csv_df.sort_values(
+                by=["Saved At", "Quote #"], ascending=[False, False], na_position="last"
+            ).reset_index(drop=True)
+            csv_export_df = csv_df[
+                [
+                    "Quote #",
+                    "client",
+                    "phone",
+                    "email",
+                    "address",
+                    "area_manager",
+                    "Quote Date",
+                    "total_labour",
+                    "man_days_available",
+                    "status",
+                    "Saved At",
+                ]
+            ].rename(
+                columns={
+                    "client": "Client",
+                    "phone": "Phone",
+                    "email": "Email",
+                    "address": "Address",
+                    "area_manager": "Area Manager",
+                    "total_labour": "Labour Total",
+                    "man_days_available": "Man-Days",
+                    "status": "Status",
+                }
+            )
+            st.download_button(
+                "⬇️ Export All Quotes (CSV)",
+                data=csv_export_df.to_csv(index=False).encode("utf-8"),
+                file_name="saved_quotes_all.csv",
+                mime="text/csv",
+                type="secondary",
+                width="content",
+            )
+
+            total_rows = len(table_df)
+            c1, c2, c3 = st.columns([1, 1, 2])
+            with c1:
+                page_size = int(
+                    st.selectbox(
+                        "Rows per page",
+                        options=[10, 20, 50, 100],
+                        index=1,
+                        key="quotes_page_size",
+                    )
+                )
+            total_pages = max(1, (total_rows + page_size - 1) // page_size)
+            with c2:
+                page = int(
+                    st.number_input(
+                        "Page",
+                        min_value=1,
+                        max_value=total_pages,
+                        value=1,
+                        step=1,
+                        key="quotes_page_number",
+                    )
+                )
+            with c3:
+                st.caption(f"Showing page {page} of {total_pages} ({total_rows} saved quotes)")
+
+            start_idx = (page - 1) * page_size
+            end_idx = start_idx + page_size
+            page_df = table_df.iloc[start_idx:end_idx].copy()
+
+            col_widths = [0.4, 1.0, 1.6, 1.2, 1.1, 1.1, 0.9, 1.1]
+            header_cols = st.columns(col_widths)
+            header_cols[0].markdown("**Row**")
+            header_cols[1].markdown("**Quote #**")
+            header_cols[2].markdown("**Client**")
+            header_cols[3].markdown("**Quote Date**")
+            header_cols[4].markdown("**Labour Total**")
+            header_cols[5].markdown("**Man-Days**")
+            header_cols[6].markdown("**Status**")
+            header_cols[7].markdown("**Details/Edit**")
+
+            for i, row in page_df.iterrows():
+                row_cols = st.columns(col_widths)
+                row_cols[0].write(int(row.get("Row", 0)))
+                row_cols[1].write(str(row.get("Quote #", "")))
+                row_cols[2].write(str(row.get("Client", "")))
+                row_cols[3].write(str(row.get("Quote Date", "")))
+                row_cols[4].write(str(row.get("Labour Total", "")))
+                row_cols[5].write(str(row.get("Man-Days", "")))
+                row_cols[6].write(str(row.get("Status", "")))
+
+                quote_no = str(row.get("Quote #", "") or "")
+                if quote_no:
+                    _tab6_token = _create_auth_token(quote_no)
+                    _tab6_url = f"?auth_token={_url_quote(_tab6_token, safe='')}"
+                    row_cols[7].markdown(
+                        f'<a href="{_tab6_url}" target="_blank" rel="noopener noreferrer"'
+                        f' style="display:inline-block;width:100%;text-align:center;'
+                        f'padding:0.35rem 0.5rem;border-radius:0.35rem;'
+                        f'border:1px solid rgba(49,51,63,0.2);'
+                        f'color:inherit;font-size:0.875rem;'
+                        f'text-decoration:none;white-space:nowrap;">'
+                        f"Details/Edit</a>",
+                        unsafe_allow_html=True,
+                    )
