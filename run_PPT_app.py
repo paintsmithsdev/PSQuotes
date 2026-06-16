@@ -11,4 +11,4 @@ def open_browser():
 if __name__ == "__main__":
     threading.Timer(1, open_browser).start()
     sys.argv = ["streamlit", "run", "ppt_job_app.py", "--server.headless=true", "--server.port=8501"]
-    streamlit.web.bootstrap.run() # This is the line that starts the Streamlit server
+    streamlit.web.bootstrap.run()
