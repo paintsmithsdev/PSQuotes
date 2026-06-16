@@ -44,6 +44,10 @@ def _cached_attendance(job_no=None): return db_sheets.get_attendance(job_no)
 def _cached_bonus_log(): return db_sheets.get_bonus_log()
 @st.cache_data(ttl=120, show_spinner=False)
 def _cached_job_history(): return db_sheets.get_job_history()
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_custom_rates(): return db_sheets.load_custom_rates()
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_additional_rates(): return db_sheets.load_custom_additional_rates()
 
 def _clear_cloud_cache():
     _cached_clients.clear()
@@ -52,6 +56,8 @@ def _clear_cloud_cache():
     _cached_attendance.clear()
     _cached_bonus_log.clear()
     _cached_job_history.clear()
+    _cached_custom_rates.clear()
+    _cached_additional_rates.clear()
 
 def _sort_master_rates_df(df):
     """Ensure # column exists, fill gaps, and sort rows by # (dropdown order)."""
@@ -131,7 +137,7 @@ def _apply_tab2_editor_edits(base_df, edited_show, area_only, job_notes_col):
 
 def _load_master_rates_dataframe():
     """Load master rates from DB, or built-in defaults when nothing is saved yet."""
-    loaded = db_sheets.load_custom_rates()
+    loaded = _cached_custom_rates()
     if len(loaded) == 4:
         custom_rates, custom_units, custom_notes, sort_orders = loaded
     else:
@@ -335,7 +341,7 @@ def _update_session_additional_rates_from_df(df=None):
 
 
 def _load_master_additional_rates_dataframe():
-    loaded = db_sheets.load_custom_additional_rates()
+    loaded = _cached_additional_rates()
     if loaded:
         data = [
             {
@@ -828,6 +834,7 @@ with tab_master:
         sorted_df = _prepare_master_rates_df(edited_df)
         _mr, _mu, _mn = _df_to_rate_dicts(sorted_df)
         db_sheets.save_custom_rates(_mr, _mu, _mn)
+        _clear_cloud_cache()
         st.session_state.master_rates_df = sorted_df
         st.session_state.item_rates_df = sorted_df.copy()
         st.session_state.ITEM_RATES = _mr
@@ -841,6 +848,7 @@ with tab_master:
     if reset_clicked:
         _mr, _mu, _mn = _df_to_rate_dicts(pd.DataFrame(DEFAULT_MASTER_RATES))
         db_sheets.save_custom_rates(_mr, _mu, _mn)
+        _clear_cloud_cache()
         st.session_state.master_rates_df = _prepare_master_rates_df(pd.DataFrame(DEFAULT_MASTER_RATES))
         st.session_state.item_rates_df = st.session_state.master_rates_df.copy()
         _update_session_rates_from_df(st.session_state.master_rates_df)
@@ -883,6 +891,7 @@ with tab_master:
     if add_save_clicked:
         sorted_additional_df = _prepare_master_additional_rates_df(edited_additional_df)
         db_sheets.save_custom_additional_rates(_additional_rates_df_to_db_rows(sorted_additional_df))
+        _clear_cloud_cache()
         st.session_state.master_additional_rates_df = sorted_additional_df
         _update_session_additional_rates_from_df(sorted_additional_df)
         st.session_state.rates_version += 1
@@ -895,6 +904,7 @@ with tab_master:
             pd.DataFrame(DEFAULT_MASTER_ADDITIONAL_RATES)
         )
         db_sheets.save_custom_additional_rates(_additional_rates_df_to_db_rows(default_additional_df))
+        _clear_cloud_cache()
         st.session_state.master_additional_rates_df = default_additional_df
         _update_session_additional_rates_from_df(default_additional_df)
         st.session_state.rates_version += 1
@@ -998,7 +1008,7 @@ with tab_quote:
     client_options = ["— New Client —"]
     if DB_READY:
         try:
-            clients_df = db_sheets.get_all_clients()
+            clients_df = _cached_clients()
             if not clients_df.empty:
                 client_options += sorted(clients_df["client"].astype(str).unique().tolist())
         except: pass
@@ -1007,7 +1017,7 @@ with tab_quote:
         selected = st.session_state.get("client_select")
         if selected == "— New Client —" or not DB_READY: return
         try:
-            clients_df = db_sheets.get_all_clients()
+            clients_df = _cached_clients()
             row = clients_df[clients_df["client"] == selected].iloc[0]
             st.session_state.client = row.get("client", selected)
             st.session_state.client_phone = row.get("phone", "")

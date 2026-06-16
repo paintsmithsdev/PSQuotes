@@ -4,11 +4,19 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime
+from typing import Callable, TypeVar
 
 import gspread
 import pandas as pd
 from google.oauth2.service_account import Credentials
+from gspread.exceptions import APIError
+
+T = TypeVar("T")
+
+_sp_cache = None
+_worksheets_verified = False
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -125,7 +133,31 @@ def save_spreadsheet_id(sheet_id: str) -> None:
         json.dump({"spreadsheet_id": sheet_id.strip()}, f, indent=2)
 
 
+def _reset_connection_cache() -> None:
+    global _sp_cache, _worksheets_verified
+    _sp_cache = None
+    _worksheets_verified = False
+
+
+def _retry_on_quota(func: Callable[..., T], *args, **kwargs) -> T:
+    """Retry Google Sheets calls when the per-minute read/write quota is hit."""
+    for attempt in range(5):
+        try:
+            return func(*args, **kwargs)
+        except APIError as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status == 429 and attempt < 4:
+                time.sleep(min(2**attempt * 3, 45))
+                continue
+            raise
+
+
 def connect():
+    global _sp_cache, _worksheets_verified
+
+    if _sp_cache is not None:
+        return _sp_cache
+
     creds = _load_credentials()
     if creds is None:
         raise RuntimeError(
@@ -137,8 +169,10 @@ def connect():
             "Spreadsheet ID not configured. Run setup_sheets.py or set spreadsheet_id in secrets."
         )
     gc = gspread.authorize(creds)
-    sp = gc.open_by_key(sheet_id)
-    _ensure_worksheets(sp)
+    sp = _retry_on_quota(gc.open_by_key, sheet_id)
+    _retry_on_quota(_ensure_worksheets, sp)
+    _worksheets_verified = True
+    _sp_cache = sp
     return sp
 
 
@@ -147,11 +181,7 @@ def _ensure_worksheets(sp) -> None:
     for name, headers in SHEET_HEADERS.items():
         if name not in existing:
             ws = sp.add_worksheet(title=name, rows=1000, cols=max(len(headers), 1))
-            ws.update([headers], "A1")
-            continue
-        ws = sp.worksheet(name)
-        if not ws.row_values(1):
-            ws.update([headers], "A1")
+            _retry_on_quota(ws.update, [headers], "A1")
 
 
 def _worksheet(name: str):
@@ -162,7 +192,7 @@ def _read_dataframe(name: str) -> pd.DataFrame:
     if not is_configured():
         return pd.DataFrame(columns=SHEET_HEADERS[name])
     ws = _worksheet(name)
-    records = ws.get_all_records()
+    records = _retry_on_quota(ws.get_all_records)
     headers = SHEET_HEADERS[name]
     if not records:
         return pd.DataFrame(columns=headers)
@@ -172,9 +202,9 @@ def _read_dataframe(name: str) -> pd.DataFrame:
 def _upsert_by_key(name: str, key_field: str, key_value: str, row: dict) -> None:
     ws = _worksheet(name)
     headers = SHEET_HEADERS[name]
-    values = ws.get_all_values()
+    values = _retry_on_quota(ws.get_all_values)
     if not values:
-        ws.update([headers], "A1")
+        _retry_on_quota(ws.update, [headers], "A1")
         values = [headers]
 
     header_row = values[0]
@@ -188,10 +218,10 @@ def _upsert_by_key(name: str, key_field: str, key_value: str, row: dict) -> None
 
     for row_num, existing in enumerate(values[1:], start=2):
         if len(existing) > key_idx and str(existing[key_idx]) == key_value:
-            ws.update([row_values], f"A{row_num}")
+            _retry_on_quota(ws.update, [row_values], f"A{row_num}")
             return
 
-    ws.append_row(row_values, value_input_option="USER_ENTERED")
+    _retry_on_quota(ws.append_row, row_values, value_input_option="USER_ENTERED")
 
 
 def _replace_sheet(name: str, rows: list[dict]) -> None:
@@ -200,9 +230,8 @@ def _replace_sheet(name: str, rows: list[dict]) -> None:
     data = [headers]
     for row in rows:
         data.append([row.get(h, "") for h in headers])
-  # Pad to at least header row if empty
-    ws.clear()
-    ws.update(data, "A1")
+    _retry_on_quota(ws.clear)
+    _retry_on_quota(ws.update, data, "A1")
 
 
 # ====================== CLIENTS ======================
