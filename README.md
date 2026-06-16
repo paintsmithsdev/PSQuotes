@@ -58,7 +58,7 @@ The app uses Google Sheets as a cloud database so multiple users can access the 
 python setup_sheets.py
 ```
 
-The script will ask you to paste the spreadsheet URL. It then saves the ID and creates 5 worksheets (Clients, Jobs, Quote_Areas, Attendance, Bonus_Log) with the correct headers.
+The script will ask you to paste the spreadsheet URL. It then saves the ID and creates 7 worksheets (`Clients`, `Jobs`, `Quote_Areas`, `Attendance`, `Bonus_Log`, `Custom_Rates`, `Additional_Rates`) with the correct headers.
 
 ### e) Share the spreadsheet (optional)
 
@@ -67,13 +67,39 @@ If you want team members to view the raw data in Google Sheets, share the spread
 ## 4) Run the web app
 
 ```powershell
-streamlit run ppt_job_app.py
-```
+python -m streamlit run ppt_job_app.py```
+
+Or double-click `run_app.bat` in the project folder.
 
 Then open the local URL shown in the terminal (usually `http://localhost:8501`).
 
 ## Notes
 
-- The app works without Google Sheets credentials — cloud features are simply disabled and it runs in session-only mode.
-- All PDF generation runs locally in your browser session.
-- Never commit `credentials.json` or `sheet_config.json` to version control (both are in `.gitignore`).
+- **Google Sheets is required** for saving clients, jobs, and master rates. Run `setup_sheets.py` once locally, or configure Streamlit Cloud secrets (see below).
+- PDFs are generated with **ReportLab** (no Microsoft Word required) — suitable for Streamlit Community Cloud on Linux.
+- Word quote export (`.docx`) still uses `template.docx` if present in the app folder.
+- Never commit `credentials.json`, `sheet_config.json`, or `email_config.txt` to version control.
+
+## Streamlit Community Cloud secrets
+
+For cloud deploy, add this in **App settings → Secrets** (instead of local files):
+
+```toml
+spreadsheet_id = "your-google-sheet-id"
+
+[gcp_service_account]
+type = "service_account"
+project_id = "your-project"
+private_key_id = "..."
+private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+client_email = "something@project.iam.gserviceaccount.com"
+client_id = "..."
+# ... remaining service account fields from credentials.json
+
+[smtp]
+sender_email = "quotes@example.com"
+password = "your-smtp-password"
+smtp_server = "mail.example.com"
+smtp_port = "587"
+use_tls = "True"
+```

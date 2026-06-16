@@ -1,8 +1,7 @@
-streamlit>=1.48.0
-pandas
+streamlit>=1.48.0,<2
+pandas>=2.2,<3
 plotly
 reportlab
 docxtpl
-pywin32
 gspread
 google-auth

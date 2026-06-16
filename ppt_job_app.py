@@ -6,754 +6,30 @@ import pandas as pd
 import plotly.express as px
 import os
 import smtplib
-import pythoncom
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
 from datetime import date
 from io import BytesIO
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.enums import TA_CENTER
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import mm
-from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-import db_local as db_sheets
+import db_sheets
+from pdf_linux import generate_letterhead_pdf, generate_quote_pdf
 
 st.set_page_config(page_title="Pro Paint Teams Job/Site Worksheet", layout="wide")
 st.title("Pro Paint Teams Job/Site Worksheet App")
-st.caption("Version 2.7 – Master Rates: paint specs + additionals, edit in form, save to sort & store")
+st.caption("Version 2.8 – Google Sheets + Linux-compatible PDFs")
 
-DB_READY = True
+try:
+    DB_READY = db_sheets.is_configured()
+except Exception:
+    DB_READY = False
+if not DB_READY:
+    st.warning(
+        "Google Sheets not configured — cloud save disabled. "
+        "Run setup_sheets.py locally or add secrets on Streamlit Cloud."
+    )
 
 # ====================== HELPER FUNCTIONS ======================
-
-def _build_pdf(elements):
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
-        leftMargin=12*mm,
-        rightMargin=12*mm,
-        topMargin=12*mm,
-        bottomMargin=12*mm
-    )
-    doc.build(elements)
-    return buffer.getvalue()
-
-def _simple_table(data, col_widths):
-    """Improved table – guaranteed A4 fit with proper word wrapping"""
-    styles = getSampleStyleSheet()
-    normal_style = ParagraphStyle(
-        'Normal',
-        parent=styles['Normal'],
-        fontSize=9,
-        leading=11,
-        spaceAfter=2,
-        wordWrap='CJK'
-    )
-    table_data = []
-    for row in data:
-        new_row = [
-            Paragraph(str(cell), normal_style) if isinstance(cell, str) else cell
-            for cell in row
-        ]
-        table_data.append(new_row)
-
-    table = Table(
-        table_data,
-        repeatRows=1,
-        colWidths=col_widths,
-        splitByRow=1
-    )
-    table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, -1), 9),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 3),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-        ("TOPPADDING", (0, 0), (-1, -1), 3),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-    ]))
-    return table
-
-
-def _doc_content_width_inches(doc) -> float:
-    """Printable width between left and right margins (inches)."""
-    section = doc.sections[-1]
-    return (
-        section.page_width.inches
-        - section.left_margin.inches
-        - section.right_margin.inches
-    )
-
-
-def _apply_table_column_widths(table, doc, relative_widths: list, margin_factor: float = 0.98):
-    """Scale relative column weights so the table fits inside page margins."""
-    available = _doc_content_width_inches(doc) * margin_factor
-    total = sum(relative_widths)
-    if total <= 0 or available <= 0:
-        return
-    from docx.shared import Inches
-
-    table.autofit = False
-    scale = available / total
-    for col_idx, rel in enumerate(relative_widths):
-        w = rel * scale
-        for cell in table.columns[col_idx].cells:
-            cell.width = Inches(w)
-
-
-# PDF table column widths (relative numbers; scaled to page by _apply_table_column_widths).
-# Edit the list for each export to change column sizing.
-PDF_COL_WIDTHS_TAB1_QUOTE = [0.70, 0.75, 0.45, 0.70, 0.70, 1.50, 1.25]
-PDF_COL_WIDTHS_TAB3_ATTENDANCE = [1.15] + [0.30] * 31 + [0.50, 0.55]  # Name, days 1–31, Totals, R/value
-# Tab 3 attendance PDF table font (points). Edit here to change PDF table text size.
-ATTENDANCE_PDF_HEADER_PT = 9.0
-ATTENDANCE_PDF_BODY_PT = 8.0
-ATTENDANCE_PDF_SUMMARY_PT = 7.0  # Bottom bonus block (compact for single-page fit)
-
-
-def _force_cell_font_pt(cell, size_pt: float, *, bold: bool = False, center: bool = True):
-    """Set font size on every run in a table cell (OOXML + python-docx for reliable PDF export)."""
-    from docx.shared import Pt
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from docx.oxml import OxmlElement
-    from docx.oxml.ns import qn
-
-    half_pts = str(int(round(float(size_pt) * 2)))
-
-    for paragraph in cell.paragraphs:
-        if center:
-            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        paragraph.paragraph_format.space_before = 0
-        paragraph.paragraph_format.space_after = 0
-        if not paragraph.runs and (paragraph.text or "").strip():
-            paragraph.add_run(paragraph.text)
-        for run in paragraph.runs:
-            run.bold = bold
-            run.font.size = Pt(size_pt)
-            r_pr = run._element.get_or_add_rPr()
-            for tag in ("w:sz", "w:szCs"):
-                el = r_pr.find(qn(tag))
-                if el is None:
-                    el = OxmlElement(tag)
-                    r_pr.append(el)
-                el.set(qn("w:val"), half_pts)
-
-
-def _format_attendance_pdf_table(table, doc):
-    """Landscape layout + compact fonts for Tab 3 attendance grid (34 columns)."""
-    from docx.enum.section import WD_ORIENT
-    from docx.shared import Inches
-
-    for section in doc.sections:
-        if section.page_width < section.page_height:
-            section.page_width, section.page_height = section.page_height, section.page_width
-        section.orientation = WD_ORIENT.LANDSCAPE
-        section.left_margin = Inches(0.3)
-        section.right_margin = Inches(0.3)
-        section.top_margin = Inches(0.4)
-        section.bottom_margin = Inches(0.4)
-
-    for r_idx, row in enumerate(table.rows):
-        size_pt = ATTENDANCE_PDF_HEADER_PT if r_idx == 0 else ATTENDANCE_PDF_BODY_PT
-        for cell in row.cells:
-            _force_cell_font_pt(
-                cell,
-                size_pt,
-                bold=(r_idx == 0),
-                center=True,
-            )
-    _apply_table_column_widths(table, doc, PDF_COL_WIDTHS_TAB3_ATTENDANCE)
-
-
-TAB2_JOB_SPEC_LINE_SPACING = 1.35
-
-
-def _tab2_pdf_set_spacing(paragraph, space_before=0, space_after=6):
-    """Comfortable line spacing for Tab 2 Job Spec PDF body text."""
-    from docx.enum.text import WD_LINE_SPACING
-    from docx.shared import Pt
-
-    pf = paragraph.paragraph_format
-    if space_before:
-        pf.space_before = Pt(space_before)
-    if space_after is not None:
-        pf.space_after = Pt(space_after)
-    pf.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
-    pf.line_spacing = TAB2_JOB_SPEC_LINE_SPACING
-
-
-def _tab2_pdf_table_row_bottom_rule(table, row_idx=0):
-    """Light full-width horizontal rule under a table row."""
-    from docx.oxml import OxmlElement
-    from docx.oxml.ns import qn
-
-    for cell in table.rows[row_idx].cells:
-        tc_pr = cell._tc.get_or_add_tcPr()
-        tc_bdr = tc_pr.find(qn("w:tcBdr"))
-        if tc_bdr is None:
-            tc_bdr = OxmlElement("w:tcBdr")
-            tc_pr.append(tc_bdr)
-        bottom = OxmlElement("w:bottom")
-        bottom.set(qn("w:val"), "single")
-        bottom.set(qn("w:sz"), "6")
-        bottom.set(qn("w:space"), "0")
-        bottom.set(qn("w:color"), "BFBFBF")
-        tc_bdr.append(bottom)
-
-
-def _tab2_pdf_writing_line(doc):
-    """Blank ruled line for handwritten notes on the Job Spec PDF."""
-    p = doc.add_paragraph("_" * 74)
-    _tab2_pdf_set_spacing(p, space_after=10)
-    return p
-
-
-def _tab2_pdf_no_wrap_cell(cell):
-    """Keep each line in a table cell from wrapping onto the next line."""
-    from docx.oxml import OxmlElement
-    from docx.oxml.ns import qn
-
-    tc_pr = cell._tc.get_or_add_tcPr()
-    if tc_pr.find(qn("w:noWrap")) is None:
-        tc_pr.append(OxmlElement("w:noWrap"))
-
-
-def _tab2_pdf_add_right_info_line(cell, label, value, space_after=3):
-    """Right-aligned label/value line for Job Spec PDF info blocks."""
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-
-    p = cell.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    p.paragraph_format.keep_together = True
-    _tab2_pdf_set_spacing(p, space_after=space_after)
-    p.add_run(label).bold = True
-    p.add_run(str(value or ""))
-    return p
-
-
-def _set_tab2_area_desc_cell(cell, area_desc: str, job_notes: str):
-    """Area + Interior/Exterior in bold; job notes in normal text on following line(s)."""
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-
-    cell.text = ""
-    p = cell.paragraphs[0]
-    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    p.paragraph_format.space_before = 0
-    p.paragraph_format.space_after = 4
-    run = p.add_run(str(area_desc or ""))
-    run.bold = True
-    notes = str(job_notes or "").strip()
-    if notes:
-        p2 = cell.add_paragraph()
-        p2.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        p2.paragraph_format.space_before = 0
-        p2.paragraph_format.space_after = 0
-        p2.add_run(notes)
-
-
-def _render_tab2_job_spec_body(doc, job_no, total_man_days, sections, client_info=None):
-    """Render Tab 2 Job Spec PDF as section blocks (no table), per Quote App template."""
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-
-    client_info = client_info or {}
-
-    info_table = doc.add_table(rows=1, cols=2)
-    info_table.alignment = 0
-    info_table.autofit = False
-    left_cell, right_cell = info_table.rows[0].cells[0], info_table.rows[0].cells[1]
-
-    lp = left_cell.paragraphs[0]
-    lp.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    _tab2_pdf_set_spacing(lp, space_after=4)
-    lp_title = lp.add_run("Customer Info")
-    lp_title.bold = True
-    for label, key in (
-        ("Client: ", "client"),
-        ("Phone: ", "phone"),
-        ("Email: ", "email"),
-        ("Address: ", "address"),
-    ):
-        p = left_cell.add_paragraph()
-        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        _tab2_pdf_set_spacing(p, space_after=3)
-        p.add_run(label).bold = True
-        p.add_run(str(client_info.get(key, "") or ""))
-
-    rp = right_cell.paragraphs[0]
-    rp.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    rp.paragraph_format.keep_together = True
-    _tab2_pdf_set_spacing(rp, space_after=4)
-    rp_title = rp.add_run("Area Manager Info")
-    rp_title.bold = True
-    _tab2_pdf_add_right_info_line(
-        right_cell, "Area Manager: ", client_info.get("area_manager", ""), space_after=3
-    )
-    _tab2_pdf_add_right_info_line(
-        right_cell, "Phone: ", client_info.get("am_phone", ""), space_after=3
-    )
-    _tab2_pdf_add_right_info_line(
-        right_cell, "Email: ", client_info.get("am_email", ""), space_after=0
-    )
-    _tab2_pdf_no_wrap_cell(right_cell)
-
-    _apply_table_column_widths(info_table, doc, [1.0, 1.0], margin_factor=0.98)
-
-    info_spacer = doc.add_paragraph("")
-    _tab2_pdf_set_spacing(info_spacer, space_after=12)
-
-    hdr_table = doc.add_table(rows=1, cols=2)
-    hdr_table.alignment = 0
-    hdr_table.autofit = False
-    hdr_left, hdr_right = hdr_table.rows[0].cells[0], hdr_table.rows[0].cells[1]
-
-    hp_left = hdr_left.paragraphs[0]
-    hp_left.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    _tab2_pdf_set_spacing(hp_left, space_after=8)
-    hp_left.add_run("Quote Number: ").bold = True
-    hp_left.add_run(str(job_no or ""))
-
-    hp_right = hdr_right.paragraphs[0]
-    hp_right.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    _tab2_pdf_set_spacing(hp_right, space_after=8)
-    hp_right.add_run("Total Allowed Man-days: ").bold = True
-    hp_right.add_run(f"{float(total_man_days or 0):.2f}")
-
-    _apply_table_column_widths(hdr_table, doc, [1.0, 1.0], margin_factor=0.98)
-    _tab2_pdf_table_row_bottom_rule(hdr_table)
-
-    hdr_spacer = doc.add_paragraph("")
-    _tab2_pdf_set_spacing(hdr_spacer, space_after=14)
-
-    for sec in sections or []:
-        p_title = doc.add_paragraph()
-        _tab2_pdf_set_spacing(p_title, space_before=12, space_after=6)
-        title_run = p_title.add_run(str(sec.get("title", "")))
-        title_run.bold = True
-
-        p_qty = doc.add_paragraph()
-        _tab2_pdf_set_spacing(p_qty, space_after=8)
-        qty_label = p_qty.add_run("Qty: ")
-        qty_label.bold = True
-        p_qty.add_run(str(sec.get("qty_line", "")))
-
-        p_jn = doc.add_paragraph()
-        _tab2_pdf_set_spacing(p_jn, space_after=4)
-        jn_label = p_jn.add_run("Job Notes(steps)")
-        jn_label.bold = True
-
-        steps = sec.get("job_note_steps") or []
-        if not steps:
-            for n in range(1, 4):
-                p_step = doc.add_paragraph(f"{n}. .")
-                _tab2_pdf_set_spacing(p_step, space_after=5)
-        else:
-            for n, step in enumerate(steps, 1):
-                p_step = doc.add_paragraph(f"{n}. {step}")
-                _tab2_pdf_set_spacing(p_step, space_after=5)
-
-        p_notes = doc.add_paragraph()
-        _tab2_pdf_set_spacing(p_notes, space_before=10, space_after=6)
-        notes_label = p_notes.add_run("Notes:")
-        notes_label.bold = True
-        notes_text = str(sec.get("notes", "") or "").strip()
-        if notes_text:
-            p_prefill = doc.add_paragraph(notes_text)
-            _tab2_pdf_set_spacing(p_prefill, space_after=6)
-        for _ in range(3):
-            _tab2_pdf_writing_line(doc)
-
-        p_chk = doc.add_paragraph()
-        _tab2_pdf_set_spacing(p_chk, space_before=12, space_after=6)
-        chk_label = p_chk.add_run("Completed & Checked:")
-        chk_label.bold = True
-        p_sig = doc.add_paragraph(
-            " Name__________________________             Signed___________________________"
-        )
-        _tab2_pdf_set_spacing(p_sig, space_after=0)
-
-        spacer = doc.add_paragraph("")
-        _tab2_pdf_set_spacing(spacer, space_after=18)
-
-
-# ====================== WORD COM: DOCX -> PDF ======================
-def _convert_docx_to_pdf(docx_path: str, pdf_path: str) -> None:
-    """Convert .docx to PDF using Word COM (ExportAsFixedFormat, then SaveAs fallback)."""
-    from win32com.client import DispatchEx
-
-    docx_abs = os.path.abspath(docx_path)
-    pdf_abs = os.path.abspath(pdf_path)
-    word = None
-    docx_obj = None
-    try:
-        word = DispatchEx("Word.Application")
-        word.Visible = False
-        word.DisplayAlerts = 0
-        docx_obj = word.Documents.Open(docx_abs, ReadOnly=True)
-        try:
-            docx_obj.ExportAsFixedFormat(
-                OutputFileName=pdf_abs,
-                ExportFormat=17,
-            )
-        except Exception:
-            docx_obj.SaveAs(pdf_abs, FileFormat=17)
-    finally:
-        if docx_obj is not None:
-            try:
-                docx_obj.Close(False)
-            except Exception:
-                pass
-        if word is not None:
-            try:
-                word.Quit()
-            except Exception:
-                pass
-
-    if not os.path.exists(pdf_abs) or os.path.getsize(pdf_abs) == 0:
-        raise RuntimeError(
-            "Word did not produce a PDF. Check that Microsoft Word is installed "
-            "and not blocked by another open document."
-        )
-
-
-# ====================== FINAL PDF-ONLY HELPER - NO XML CODE ======================
-def generate_letterhead_pdf(
-    tab_title: str,
-    job_no: str,
-    client: str = "",
-    content_lines: list = None,
-    content_pairs: list = None,
-    table_rows: list = None,
-    client_info: dict = None,
-    force_portrait: bool = False,
-    attendance_meta: dict = None,
-    template_candidates: list = None,
-    attendance_table: bool = False,
-    job_spec_sections: list = None,
-    total_man_days: float = None,
-):
-    """Builds .docx with Letterhead + visible table (using only safe high-level code), then converts to PDF using Word COM."""
-    try:
-        from docx import Document
-        import tempfile
-        import os
-        import pythoncom
-        from docx.enum.section import WD_ORIENT
-        from docx.shared import Pt, Inches
-        from docx.enum.text import WD_ALIGN_PARAGRAPH
-        from docx.oxml import OxmlElement
-        from docx.oxml.ns import qn
-
-        def _force_table_borders(docx_table):
-            """Apply explicit borders so PDF export always shows grid lines."""
-            tbl = docx_table._tbl
-            tbl_pr = tbl.tblPr
-            tbl_borders = tbl_pr.find(qn("w:tblBorders"))
-            if tbl_borders is None:
-                tbl_borders = OxmlElement("w:tblBorders")
-                tbl_pr.append(tbl_borders)
-
-            for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
-                edge_tag = qn(f"w:{edge}")
-                edge_el = tbl_borders.find(edge_tag)
-                if edge_el is None:
-                    edge_el = OxmlElement(f"w:{edge}")
-                    tbl_borders.append(edge_el)
-                edge_el.set(qn("w:val"), "single")
-                edge_el.set(qn("w:sz"), "10")      # 10/8 pt line weight
-                edge_el.set(qn("w:space"), "0")
-                edge_el.set(qn("w:color"), "000000")
-
-        def _shade_cell(cell, fill="D9D9D9"):
-            """Apply grey shading to a cell."""
-            tc_pr = cell._tc.get_or_add_tcPr()
-            shd = tc_pr.find(qn("w:shd"))
-            if shd is None:
-                shd = OxmlElement("w:shd")
-                tc_pr.append(shd)
-            shd.set(qn("w:val"), "clear")
-            shd.set(qn("w:color"), "auto")
-            shd.set(qn("w:fill"), fill)
-
-        pythoncom.CoInitialize()
-
-        letterhead_path = None
-        docx_candidates = template_candidates or [
-            "letterhead.docx",
-            "Letterhead.docx",
-            "template.docx",
-            "Template.docx",
-        ]
-        for candidate in docx_candidates:
-            if os.path.exists(candidate):
-                letterhead_path = candidate
-                break
-        if not letterhead_path:
-            st.error("❌ No template .docx found in app folder.")
-            return None
-
-        doc = Document(letterhead_path)
-
-        if force_portrait:
-            for section in doc.sections:
-                # Ensure the exported PDF uses portrait orientation for this document.
-                if section.page_width > section.page_height:
-                    section.page_width, section.page_height = section.page_height, section.page_width
-                section.orientation = WD_ORIENT.PORTRAIT
-
-        # Remove trailing empty paragraphs from template so title sits directly under letterhead.
-        while doc.paragraphs and not doc.paragraphs[-1].text.strip():
-            p = doc.paragraphs[-1]._element
-            p.getparent().remove(p)
-
-        heading = doc.add_heading(tab_title, level=1)
-        heading.paragraph_format.space_before = 0
-        heading.paragraph_format.space_after = 4 if attendance_meta else 6
-
-        # Attendance header: client info (left) + completed date & signature (right).
-        if attendance_meta:
-            info_table = doc.add_table(rows=1, cols=2)
-            info_table.alignment = 0
-            info_table.autofit = False
-            left_cell, right_cell = info_table.rows[0].cells[0], info_table.rows[0].cells[1]
-
-            lp = left_cell.paragraphs[0]
-            lp.paragraph_format.space_after = 2
-            lp.add_run("Client: ").bold = True
-            lp.add_run(str(attendance_meta.get("client", "") or ""))
-            lp2 = left_cell.add_paragraph()
-            lp2.paragraph_format.space_after = 2
-            lp2.add_run("Job: ").bold = True
-            lp2.add_run(str(attendance_meta.get("job_no", "") or ""))
-            lp3 = left_cell.add_paragraph()
-            lp3.paragraph_format.space_after = 0
-            lp3.add_run("Address: ").bold = True
-            lp3.add_run(str(attendance_meta.get("address", "") or ""))
-
-            rp = right_cell.paragraphs[0]
-            rp.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            rp.paragraph_format.space_after = 4
-            rp.add_run("Completed Date: ").bold = True
-            rp2 = right_cell.add_paragraph()
-            rp2.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            rp2.paragraph_format.space_after = 0
-            rp2.add_run("Signature: ").bold = True
-            rp2.add_run(str(attendance_meta.get("signature", "") or ""))
-
-            # 50/50 columns: client left half; date/signature labels left-aligned from page centre.
-            _apply_table_column_widths(info_table, doc, [1.0, 1.0], margin_factor=0.98)
-            _force_table_borders(info_table)
-            spacer = doc.add_paragraph("")
-            spacer.paragraph_format.space_before = 0
-            spacer.paragraph_format.space_after = 2
-
-        # Tab 2 Job Spec: section blocks (no table) per Quote App template.
-        if job_spec_sections is not None:
-            _render_tab2_job_spec_body(
-                doc,
-                job_no,
-                total_man_days,
-                job_spec_sections,
-                {
-                    "client": client,
-                    "phone": (client_info or {}).get("phone", ""),
-                    "email": (client_info or {}).get("email", ""),
-                    "address": (client_info or {}).get("address", ""),
-                    "area_manager": (client_info or {}).get("area_manager", ""),
-                    "am_phone": (client_info or {}).get("am_phone", ""),
-                    "am_email": (client_info or {}).get("am_email", ""),
-                },
-            )
-
-        # Optional generic client info block (used where required).
-        elif client_info:
-            p = doc.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-            p.add_run(f"Job Number: {job_no}").bold = True
-
-            p2 = doc.add_paragraph()
-            p2.add_run("Client: ").bold = True
-            p2.add_run(str(client or ""))
-            p2.add_run("      ")
-            p2.add_run("Phone: ").bold = True
-            p2.add_run(str(client_info.get("phone", "") or ""))
-            p2.add_run("      ")
-            p2.add_run("Email: ").bold = True
-            p2.add_run(str(client_info.get("email", "") or ""))
-
-            p3 = doc.add_paragraph()
-            p3.add_run("Address: ").bold = True
-            p3.add_run(str(client_info.get("address", "") or ""))
-
-            p4 = doc.add_paragraph()
-            p4.add_run("Area Manager: ").bold = True
-            p4.add_run(str(client_info.get("area_manager", "") or ""))
-
-        # Generic body lines for sections that are text based.
-        for line in (content_lines or []):
-            if str(line).strip():
-                doc.add_paragraph(str(line))
-
-        # Optional paired label/value rows (two label groups on one line).
-        for pair_row in (content_pairs or []):
-            if not pair_row:
-                continue
-            label1, value1, label2, value2 = pair_row
-            p = doc.add_paragraph()
-            if str(label1).strip():
-                p.add_run(str(label1)).bold = True
-            p.add_run(str(value1))
-            if str(label2).strip():
-                p.add_run("      ")
-                p.add_run(str(label2)).bold = True
-                p.add_run(str(value2))
-
-        # Create table
-        if table_rows:
-            table = doc.add_table(rows=1, cols=len(table_rows[0]))
-            table.alignment = 0  # Left-align table on page.
-
-            # Header
-            hdr_cells = table.rows[0].cells
-            for i, heading in enumerate(table_rows[0]):
-                hdr_cells[i].text = str(heading)
-                for paragraph in hdr_cells[i].paragraphs:
-                    paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                    paragraph.paragraph_format.space_before = 0
-                    paragraph.paragraph_format.space_after = 0
-                    for run in paragraph.runs:
-                        run.bold = True
-                _shade_cell(hdr_cells[i], "D9D9D9")
-
-            # Data rows
-            for row_data in table_rows[1:]:
-                row_cells = table.add_row().cells
-                for i, cell_text in enumerate(row_data):
-                    if (
-                        i == 1
-                        and isinstance(cell_text, (tuple, list))
-                        and len(cell_text) >= 2
-                    ):
-                        _set_tab2_area_desc_cell(
-                            row_cells[i], cell_text[0], cell_text[1]
-                        )
-                    else:
-                        row_cells[i].text = str(cell_text)
-                    for paragraph in row_cells[i].paragraphs:
-                        paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                        paragraph.paragraph_format.space_before = 0
-                        paragraph.paragraph_format.space_after = 0
-
-            headers = [str(h).strip().lower().rstrip(":") for h in table_rows[0]]
-            is_attendance = attendance_table or (
-                len(headers) >= 34
-                and any(h.startswith("name") for h in headers)
-                and "1" in headers
-                and "31" in headers
-                and any(h.startswith("total") for h in headers)
-            )
-
-            # Table Grid style can reset cell fonts when Word exports to PDF.
-            if not is_attendance:
-                try:
-                    table.style = 'Table Grid'
-                except Exception:
-                    try:
-                        table.style = 'Light Grid'
-                    except Exception:
-                        try:
-                            table.style = 'Grid Table 1 Light'
-                        except Exception:
-                            pass
-
-            if "notes" in headers and "job note" in headers and len(headers) == 7:
-                _apply_table_column_widths(table, doc, PDF_COL_WIDTHS_TAB1_QUOTE)
-            elif is_attendance:
-                _format_attendance_pdf_table(table, doc)
-
-            # Ensure visible borders regardless of Letterhead template styles.
-            _force_table_borders(table)
-
-            # Attendance summary block under the table.
-            if attendance_meta:
-                man_days_allowed = float(
-                    attendance_meta.get("man_days_allowed", attendance_meta.get("man_days_available", 0)) or 0
-                )
-
-                sum_spacer = doc.add_paragraph("")
-                sum_spacer.paragraph_format.space_before = 0
-                sum_spacer.paragraph_format.space_after = 0
-                summary_table = doc.add_table(rows=5, cols=2)
-                summary_table.alignment = 0
-                summary_table.autofit = False
-
-                labels = [
-                    "Man Days Allowed",
-                    "Man Days Total",
-                    "Bonus Man Days",
-                    "R value of Bonus",
-                    "Bonus per Man Day",
-                ]
-                values = [
-                    f"{man_days_allowed:.1f}",
-                    "",
-                    "",
-                    "",
-                    "",
-                ]
-
-                for idx in range(5):
-                    left = summary_table.rows[idx].cells[0]
-                    right = summary_table.rows[idx].cells[1]
-                    left.text = labels[idx]
-                    right.text = values[idx]
-                    for cell in (left, right):
-                        for paragraph in cell.paragraphs:
-                            paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                            paragraph.paragraph_format.space_before = 0
-                            paragraph.paragraph_format.space_after = 0
-                    _force_cell_font_pt(
-                        left, ATTENDANCE_PDF_SUMMARY_PT, bold=True, center=False
-                    )
-                    _force_cell_font_pt(
-                        right, ATTENDANCE_PDF_SUMMARY_PT, bold=False, center=False
-                    )
-
-                _apply_table_column_widths(summary_table, doc, [2.0, 1.0], margin_factor=0.55)
-                _force_table_borders(summary_table)
-
-        # Save temp .docx
-        with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp_docx:
-            tmp_path = tmp_docx.name
-        doc.save(tmp_path)
-
-        tmp_pdf_path = tmp_path.replace(".docx", ".pdf")
-        _convert_docx_to_pdf(tmp_path, tmp_pdf_path)
-
-        # Read PDF
-        with open(tmp_pdf_path, "rb") as f:
-            pdf_buffer = BytesIO(f.read())
-
-        # Cleanup
-        os.unlink(tmp_path)
-        if os.path.exists(tmp_pdf_path):
-            os.unlink(tmp_pdf_path)
-
-        pythoncom.CoUninitialize()
-        return pdf_buffer
-
-    except Exception as e:
-        st.error(f"PDF generation error: {e}")
-        try:
-            pythoncom.CoUninitialize()
-        except:
-            pass
-        return None
 
 # Cached loaders
 @st.cache_data(ttl=120, show_spinner=False)
@@ -1398,24 +674,39 @@ tab_master, tab_quote, tab2, tab3, tab4, tab5 = st.tabs(
 )
 
 def get_email_config():
-    """Load full SMTP config from email_config.txt (next to app.py)"""
-    config_file = os.path.join(".", 'email_config.txt')
+    """Load SMTP config from Streamlit secrets or email_config.txt."""
+    try:
+        if "smtp" in st.secrets:
+            s = st.secrets["smtp"]
+            config = {k.lower(): str(v) for k, v in dict(s).items()}
+            if config.get("sender_email") and config.get("password"):
+                if "smtp_server" not in config:
+                    config["smtp_server"] = "mail." + config["sender_email"].split("@")[1]
+                if "smtp_port" not in config:
+                    config["smtp_port"] = "587"
+                if "use_tls" not in config:
+                    config["use_tls"] = "True"
+                return config
+    except Exception:
+        pass
+
+    config_file = os.path.join(".", "email_config.txt")
     if not os.path.exists(config_file):
         return None
     config = {}
-    with open(config_file, 'r', encoding='utf-8') as f:
+    with open(config_file, "r", encoding="utf-8") as f:
         for line in f:
-            if '=' in line:
-                key, value = line.strip().split('=', 1)
+            if "=" in line:
+                key, value = line.strip().split("=", 1)
                 config[key.strip().lower()] = value.strip()
-    if not all(k in config for k in ['sender_email', 'password']):
+    if not all(k in config for k in ["sender_email", "password"]):
         return None
-    if 'smtp_server' not in config:
-        config['smtp_server'] = 'mail.' + config['sender_email'].split('@')[1]
-    if 'smtp_port' not in config:
-        config['smtp_port'] = '587'
-    if 'use_tls' not in config:
-        config['use_tls'] = 'True'
+    if "smtp_server" not in config:
+        config["smtp_server"] = "mail." + config["sender_email"].split("@")[1]
+    if "smtp_port" not in config:
+        config["smtp_port"] = "587"
+    if "use_tls" not in config:
+        config["use_tls"] = "True"
     return config
 
 def send_quote_email(to_email, subject, body, attachment_buf, filename, config):
@@ -1964,33 +1255,23 @@ with tab_quote:
     # Email Quote as PDF
     if st.button("📧 Email Quote to Client (as PDF)", type="secondary", use_container_width=True, key="email_quote_btn"):
         try:
-            from docxtpl import DocxTemplate
-            import io, tempfile, os
-
-            pythoncom.CoInitialize()
-
-            if not os.path.exists("template.docx"):
-                st.error("❌ template.docx not found!")
-                st.stop()
-
-            tpl = DocxTemplate("template.docx")
-
             paint_specs = []
             for sec in _flatten_paint_sections(st.session_state.paint_sections):
-                if sec.get("area_m2", 0) <= 0: continue
+                if sec.get("area_m2", 0) <= 0:
+                    continue
                 mat, lab = calculate_section(sec)
                 unit = ITEM_UNITS.get(sec.get("item", ""), "m²")
                 paint_specs.append({
-                    "type": sec.get("type", ""), 
-                    "item": sec.get("item", ""), 
+                    "type": sec.get("type", ""),
+                    "item": sec.get("item", ""),
                     "method": sec.get("method", ""),
-                    "converted": str(int(sec.get("area_m2", 0))), 
+                    "converted": str(int(sec.get("area_m2", 0))),
                     "unit": unit,
                     "class": sec.get("paint_class", "A"),
                     "area_description": sec.get("area_description", ""),
                     "job_notes": sec.get("job_notes", ""),
-                    "materialcost": f"R{mat:,.2f}", 
-                    "labourcost": f"R{lab:,.2f}"
+                    "materialcost": f"R{mat:,.2f}",
+                    "labourcost": f"R{lab:,.2f}",
                 })
 
             additional_costs = [
@@ -1998,53 +1279,33 @@ with tab_quote:
             ]
 
             context = {
-                "clientname": client, 
+                "clientname": client,
                 "clientaddress": client_address,
-                "clientphone": client_phone, 
+                "clientphone": client_phone,
                 "clientemail": client_email,
-                "areaManagerName": area_manager, 
-                "areaManagerPhone": am_phone, 
+                "areaManagerName": area_manager,
+                "areaManagerPhone": am_phone,
                 "areaManagerEmail": am_email,
-                "quotedate": quote_date.strftime("%Y-%m-%d"), 
+                "quotedate": quote_date.strftime("%Y-%m-%d"),
                 "quotenumber": job_no,
-                "paint_specs": paint_specs, 
+                "paint_specs": paint_specs,
                 "additional_costs": additional_costs,
-                "materialtotal": f"R{total_material:,.2f}", 
+                "materialtotal": f"R{total_material:,.2f}",
                 "labourtotal": f"R{total_labour:,.2f}",
-                "additionaltotal": f"R{add_total:,.2f}", 
+                "additionaltotal": f"R{add_total:,.2f}",
                 "grandtotal": f"R{grand_total:,.2f}",
-                "grandtotal50": f"R{grand_total*0.5:,.2f}"
+                "grandtotal50": f"R{grand_total*0.5:,.2f}",
             }
 
-            tpl.render(context)
-            docx_bio = io.BytesIO()
-            tpl.save(docx_bio)
-            docx_bio.seek(0)
-
-            with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp_docx:
-                tmp_docx.write(docx_bio.getvalue())
-                tmp_docx_path = tmp_docx.name
-
-            tmp_pdf_path = tmp_docx_path.replace(".docx", ".pdf")
-            _convert_docx_to_pdf(tmp_docx_path, tmp_pdf_path)
-
-            with open(tmp_pdf_path, "rb") as f:
-                pdf_bio = io.BytesIO(f.read())
-            pdf_bio.seek(0)
-
-            os.unlink(tmp_docx_path)
-            if os.path.exists(tmp_pdf_path):
-                os.unlink(tmp_pdf_path)
-
-            pythoncom.CoUninitialize()
+            pdf_bio = generate_quote_pdf(context)
 
             email_config = get_email_config()
             if not email_config:
-                st.error("❌ email_config.txt not found or incomplete.")
+                st.error("❌ SMTP not configured. Add email_config.txt or Streamlit secrets.")
                 st.stop()
 
-            client_email = client_email.strip()
-            if not client_email:
+            client_email_addr = client_email.strip()
+            if not client_email_addr:
                 st.error("Please enter the client's email address first.")
                 st.stop()
 
@@ -2063,7 +1324,7 @@ Pro Paint Teams"""
             filename = _download_filename(job_no, client, "pdf", tab_number=1)
 
             success, message = send_quote_email(
-                client_email, subject, body, pdf_bio, filename, email_config
+                client_email_addr, subject, body, pdf_bio, filename, email_config
             )
 
             if success:
@@ -2071,19 +1332,8 @@ Pro Paint Teams"""
             else:
                 st.error(message)
 
-        except ImportError as e:
-            st.error(f"❌ Missing package for email export: {e}")
         except Exception as e:
-            st.error(
-                f"PDF conversion / Email error: {e}\n\n"
-                "Tips: close any stuck Word windows, ensure Microsoft Word is installed, "
-                "then try again."
-            )
-        finally:
-            try:
-                pythoncom.CoUninitialize()
-            except:
-                pass
+            st.error(f"PDF / Email error: {e}")
 
     # Save to Database
     st.divider()
