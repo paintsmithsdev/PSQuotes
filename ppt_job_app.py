@@ -16,6 +16,32 @@ import db_sheets
 from pdf_linux import generate_letterhead_pdf, generate_quote_pdf
 
 st.set_page_config(page_title="Pro Paint Teams Job/Site Worksheet", layout="wide")
+
+
+def _require_app_password():
+    """Block the app until the user enters the password from Streamlit secrets."""
+    if st.session_state.get("password_authenticated"):
+        return
+    try:
+        correct_password = str(st.secrets["password"])
+    except (KeyError, FileNotFoundError, AttributeError):
+        st.error("App password not configured. Add `password` to Streamlit secrets.")
+        st.stop()
+    st.title("Pro Paint Teams Job/Site Worksheet App")
+    st.caption("Version 2.8 – Google Sheets + Linux-compatible PDFs")
+    with st.form("app_login"):
+        entered = st.text_input("Password", type="password")
+        if st.form_submit_button("Enter"):
+            if entered == correct_password:
+                st.session_state.password_authenticated = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+    st.stop()
+
+
+_require_app_password()
+
 st.title("Pro Paint Teams Job/Site Worksheet App")
 st.caption("Version 2.8 – Google Sheets + Linux-compatible PDFs")
 
@@ -814,20 +840,20 @@ with tab_master:
         edited_df = st.data_editor(
             st.session_state.master_rates_df,
             num_rows="dynamic",
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             key=_MASTER_RATES_EDITOR_KEY,
             column_config=_master_rates_column_config(),
         )
         btn_save, btn_reset, btn_cancel = st.columns(3)
         save_clicked = btn_save.form_submit_button(
-            "💾 Save paint specification rates", type="primary", use_container_width=True
+            "💾 Save paint specification rates", type="primary", width="stretch"
         )
         reset_clicked = btn_reset.form_submit_button(
-            "🔄 Reset paint rates to factory defaults", use_container_width=True
+            "🔄 Reset paint rates to factory defaults", width="stretch"
         )
         cancel_clicked = btn_cancel.form_submit_button(
-            "❌ Cancel / Discard paint rate changes", use_container_width=True
+            "❌ Cancel / Discard paint rate changes", width="stretch"
         )
 
     if save_clicked:
@@ -872,20 +898,20 @@ with tab_master:
         edited_additional_df = st.data_editor(
             st.session_state.master_additional_rates_df,
             num_rows="dynamic",
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             key=_MASTER_ADDITIONAL_RATES_EDITOR_KEY,
             column_config=_master_additional_rates_column_config(),
         )
         add_btn_save, add_btn_reset, add_btn_cancel = st.columns(3)
         add_save_clicked = add_btn_save.form_submit_button(
-            "💾 Save additional rates", type="primary", use_container_width=True
+            "💾 Save additional rates", type="primary", width="stretch"
         )
         add_reset_clicked = add_btn_reset.form_submit_button(
-            "🔄 Reset additional rates to factory defaults", use_container_width=True
+            "🔄 Reset additional rates to factory defaults", width="stretch"
         )
         add_cancel_clicked = add_btn_cancel.form_submit_button(
-            "❌ Cancel / Discard additional rate changes", use_container_width=True
+            "❌ Cancel / Discard additional rate changes", width="stretch"
         )
 
     if add_save_clicked:
@@ -1207,7 +1233,7 @@ with tab_quote:
     with col4: st.metric("**Grand Total**", f"**R{grand_total:,.2f}**")
 
     # Export to Word
-    if st.button("📄 Export to Word – Exact same as index.html", type="primary", use_container_width=True, key="export_word_btn"):
+    if st.button("📄 Export to Word – Exact same as index.html", type="primary", width="stretch", key="export_word_btn"):
         try:
             from docxtpl import DocxTemplate
             import io, os
@@ -1256,14 +1282,14 @@ with tab_quote:
                 data=bio.getvalue(),
                 file_name=_download_filename(job_no, client, "docx", tab_number=1),
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                use_container_width=True
+                width="stretch"
             )
             st.success("✅ Quote exported successfully!")
         except Exception as e:
             st.error(f"Export error: {e}")
 
     # Email Quote as PDF
-    if st.button("📧 Email Quote to Client (as PDF)", type="secondary", use_container_width=True, key="email_quote_btn"):
+    if st.button("📧 Email Quote to Client (as PDF)", type="secondary", width="stretch", key="email_quote_btn"):
         try:
             paint_specs = []
             for sec in _flatten_paint_sections(st.session_state.paint_sections):
@@ -1348,7 +1374,7 @@ Pro Paint Teams"""
     # Save to Database
     st.divider()
     if DB_READY:
-        if st.button("💾 Save Quote & Client to Cloud Database", type="primary", use_container_width=True, key="save_quote_btn"):
+        if st.button("💾 Save Quote & Client to Cloud Database", type="primary", width="stretch", key="save_quote_btn"):
             try:
                 db_sheets.save_client(client, client_phone, client_email, client_address)
                 db_sheets.save_job(job_no=job_no, job_name=client, client=client,
@@ -1493,7 +1519,7 @@ with tab2:
         st.session_state.tab2_editor_df = st.data_editor(
             st.session_state.tab2_editor_df,
             num_rows="dynamic",
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_order=(
                 "Section",
@@ -1531,7 +1557,7 @@ with tab2:
     spec_sections = _tab2_job_spec_sections(paint_sections, edited_spec)
 
     # ONE SINGLE PDF DOWNLOAD BUTTON (PDF only - no extra steps)
-    if st.button("📄 Download Job Spec PDF (with Letterhead)", type="primary", use_container_width=True):
+    if st.button("📄 Download Job Spec PDF (with Letterhead)", type="primary", width="stretch"):
         pdf_buffer = generate_letterhead_pdf(
             tab_title="Job Spec & Site Man-Days",
             job_no=job_no,
@@ -1554,7 +1580,7 @@ with tab2:
                 data=pdf_buffer.getvalue(),
                 file_name=_download_filename(job_no, client, "pdf", tab_number=2),
                 mime="application/pdf",
-                use_container_width=True
+                width="stretch"
             )
 
 # ====================== TAB 3: ATTENDANCE & BONUS ======================
@@ -1625,7 +1651,7 @@ with tab3:
         edited_df = st.data_editor(
             st.session_state.attendance_df,
             num_rows="fixed",
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "Name": st.column_config.TextColumn("Name:", width="medium"),
@@ -1688,7 +1714,7 @@ with tab3:
         st.metric("Bonus per Man Day", f"R {bonus_per_man_day:,.2f}")
 
     # ==================== PDF DOWNLOAD ====================
-    if st.button("📄 Generate Attendance PDF", type="primary", use_container_width=True):
+    if st.button("📄 Generate Attendance PDF", type="primary", width="stretch"):
         att_df = st.session_state.attendance_df
         table_data = [
             ["Date"] + [""] * 31 + ["", ""],
@@ -1741,7 +1767,7 @@ with tab3:
             data=st.session_state["attendance_pdf_bytes"],
             file_name=_download_filename(job_no, client, "pdf", tab_number=3),
             mime="application/pdf",
-            use_container_width=True
+            width="stretch"
         )
 # ====================== TAB 4: EMPLOYMENT CONTRACT ======================
 with tab4:
@@ -1814,7 +1840,7 @@ Signed (Manager):  ____________________________  Date: ____________
                 data.get("job_no", ""), data.get("client", ""), "pdf", tab_number=4
             ),
             mime="application/pdf",
-            use_container_width=True,
+            width="stretch",
             type="primary"
         )
 
@@ -1855,14 +1881,14 @@ with tab5:
         if not df_spec_dash.empty:
             fig_bar = px.bar(df_spec_dash, x="Quote Area", y="Allowed Man-Days", title="Allowed Man-Days per Area", color="Allowed Man-Days", color_continuous_scale="Blues")
             fig_bar.update_layout(xaxis_tickangle=-45)
-            st.plotly_chart(fig_bar, use_container_width=True, key="dash_bar_chart")
+            st.plotly_chart(fig_bar, width="stretch", key="dash_bar_chart")
 
             fig_pie = px.pie(df_spec_dash, names="Quote Area", values="Allowed Man-Days", title="Man-Day Distribution by Area")
-            st.plotly_chart(fig_pie, use_container_width=True, key="dash_pie_chart")
+            st.plotly_chart(fig_pie, width="stretch", key="dash_pie_chart")
 
             fig_qty = px.bar(df_spec_dash, x="Quote Area", y="Quantity", title="Quantity per Area", color="Quote Area")
             fig_qty.update_layout(xaxis_tickangle=-45, showlegend=False)
-            st.plotly_chart(fig_qty, use_container_width=True, key="dash_qty_chart")
+            st.plotly_chart(fig_qty, width="stretch", key="dash_qty_chart")
 
         dash_rows = [["Quote Area", "Quantity", "Allowed Man-Days"]]
         for _, r in df_spec_dash.iterrows():
@@ -1888,6 +1914,6 @@ with tab5:
                     data.get("job_no", ""), data.get("client", ""), "pdf", extra_suffix="Dashboard"
                 ),
                 mime="application/pdf",
-                use_container_width=True,
+                width="stretch",
                 type="primary"
             )

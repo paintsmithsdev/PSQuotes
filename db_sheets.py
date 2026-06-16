@@ -10,6 +10,8 @@ from typing import Callable, TypeVar
 
 import gspread
 import pandas as pd
+from google.auth.exceptions import RefreshError
+from google.auth.transport.requests import Request
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError
 
@@ -82,6 +84,14 @@ def _config_path() -> str:
     return os.path.join(_app_dir(), "sheet_config.json")
 
 
+def _normalize_service_account_info(info: dict) -> dict:
+    normalized = dict(info)
+    private_key = normalized.get("private_key", "")
+    if isinstance(private_key, str) and "\\n" in private_key:
+        normalized["private_key"] = private_key.replace("\\n", "\n")
+    return normalized
+
+
 def _load_credentials() -> Credentials | None:
     try:
         import streamlit as st
@@ -89,7 +99,8 @@ def _load_credentials() -> Credentials | None:
         for key in ("gcp_service_account", "gcp"):
             if key in st.secrets:
                 return Credentials.from_service_account_info(
-                    dict(st.secrets[key]), scopes=SCOPES
+                    _normalize_service_account_info(dict(st.secrets[key])),
+                    scopes=SCOPES,
                 )
     except Exception:
         pass
@@ -98,6 +109,21 @@ def _load_credentials() -> Credentials | None:
     if os.path.isfile(path):
         return Credentials.from_service_account_file(path, scopes=SCOPES)
     return None
+
+
+def _verify_credentials(creds: Credentials) -> None:
+    """Refresh the token early so auth problems surface with a clear message."""
+    try:
+        creds.refresh(Request())
+    except RefreshError as exc:
+        email = getattr(creds, "service_account_email", "unknown")
+        raise RuntimeError(
+            f"Google authentication failed for service account {email}. "
+            "Google reported that this account does not exist or its key was revoked. "
+            "In Google Cloud Console → IAM & Admin → Service Accounts, confirm the account "
+            "still exists, create a new JSON key if needed, then update credentials.json "
+            "and Streamlit secrets with the new file."
+        ) from exc
 
 
 def _get_spreadsheet_id() -> str | None:
@@ -163,6 +189,7 @@ def connect():
         raise RuntimeError(
             "Google credentials not found. Add credentials.json or Streamlit secrets."
         )
+    _verify_credentials(creds)
     sheet_id = _get_spreadsheet_id()
     if not sheet_id:
         raise RuntimeError(
