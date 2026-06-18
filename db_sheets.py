@@ -101,6 +101,13 @@ SHEET_HEADERS = {
         "date_updated",
     ],
     "Additional_Rates": ["sort_order", "item", "rate_unit", "rate_value", "date_updated"],
+    "Paint_Lines": [
+        "job_no", "section_idx", "paint_class", "type",
+        "area_description", "item_idx", "item", "method", "area_m2", "job_notes",
+    ],
+    "Additional_Lines": [
+        "job_no", "sort_order", "item", "duration_days", "km", "liters",
+    ],
 }
 
 
@@ -403,6 +410,19 @@ def _replace_sheet(name: str, rows: list[dict]) -> None:
     _retry_on_quota(ws.update, data, "A1")
 
 
+def _replace_job_rows(name: str, job_no: str, new_rows: list[dict]) -> None:
+    """Replace all rows belonging to job_no with new_rows, leaving other jobs intact."""
+    ws = _worksheet(name)
+    headers = SHEET_HEADERS[name]
+    records = _retry_on_quota(ws.get_all_records)
+    job_no_str = str(job_no).strip()
+    kept = [r for r in records if str(r.get("job_no", "")).strip() != job_no_str]
+    all_rows = kept + new_rows
+    data = [headers] + [[str(r.get(h, "") or "") for h in headers] for r in all_rows]
+    _retry_on_quota(ws.clear)
+    _retry_on_quota(ws.update, data, "A1")
+
+
 def health_check() -> tuple[bool, str]:
     """Test live connectivity to Google Sheets. Returns (ok, message).
 
@@ -629,6 +649,127 @@ def load_custom_additional_rates():
             "item": row["item"],
             "rate_unit": row["rate_unit"],
             "rate_value": float(row["rate_value"]),
+        }
+        for _, row in df.iterrows()
+    ]
+
+
+# ====================== QUOTE LINE ITEMS ======================
+
+def save_paint_lines(job_no: str, paint_sections: list) -> None:
+    """Persist all paint line items for a quote, replacing any previous data."""
+    if not is_configured():
+        raise SheetsConfigError("Google Sheets is not configured")
+    rows: list[dict] = []
+    for si, section in enumerate(paint_sections):
+        for ii, item in enumerate(section.get("items", [])):
+            rows.append({
+                "job_no":            str(job_no),
+                "section_idx":       si,
+                "paint_class":       str(section.get("paint_class", "A") or "A"),
+                "type":              str(section.get("type", "Exterior") or "Exterior"),
+                "area_description":  str(section.get("area_description", "") or ""),
+                "item_idx":          ii,
+                "item":              str(item.get("item", "") or ""),
+                "method":            str(item.get("method", "Previously painted") or "Previously painted"),
+                "area_m2":           float(item.get("area_m2", 0) or 0),
+                "job_notes":         str(item.get("job_notes", "") or ""),
+            })
+    _replace_job_rows("Paint_Lines", str(job_no), rows)
+
+
+def save_additional_lines(job_no: str, additional_sections: list) -> None:
+    """Persist all additional cost lines for a quote, replacing any previous data."""
+    if not is_configured():
+        raise SheetsConfigError("Google Sheets is not configured")
+    rows: list[dict] = []
+    for i, sec in enumerate(additional_sections):
+        rows.append({
+            "job_no":        str(job_no),
+            "sort_order":    i,
+            "item":          str(sec.get("item", "") or ""),
+            "duration_days": float(sec.get("duration_days", 0) or 0),
+            "km":            float(sec.get("km", 0) or 0),
+            "liters":        float(sec.get("liters", 0) or 0),
+        })
+    _replace_job_rows("Additional_Lines", str(job_no), rows)
+
+
+def get_paint_lines(job_no: str) -> list:
+    """Return paint_sections list for the given job, reconstructed from the DB."""
+    if not is_configured():
+        return []
+    df = _read_dataframe("Paint_Lines")
+    if df.empty:
+        return []
+    df = df[df["job_no"].astype(str).str.strip() == str(job_no).strip()]
+    if df.empty:
+        return []
+    def _safe_float(val, default=0.0):
+        try:
+            return float(val) if val not in (None, "", "None") else default
+        except (ValueError, TypeError):
+            return default
+
+    def _safe_int(val, default=0):
+        try:
+            return int(float(val)) if val not in (None, "", "None") else default
+        except (ValueError, TypeError):
+            return default
+
+    sections: dict[int, dict] = {}
+    sort_cols = [c for c in ("section_idx", "item_idx") if c in df.columns]
+    if sort_cols:
+        try:
+            df = df.sort_values(sort_cols)
+        except Exception:
+            pass
+    for _, row in df.iterrows():
+        si = _safe_int(row.get("section_idx", 0))
+        if si not in sections:
+            sections[si] = {
+                "paint_class":      str(row.get("paint_class", "A") or "A"),
+                "type":             str(row.get("type", "Exterior") or "Exterior"),
+                "area_description": str(row.get("area_description", "") or ""),
+                "items":            [],
+            }
+        sections[si]["items"].append({
+            "item":      str(row.get("item", "") or ""),
+            "method":    str(row.get("method", "Previously painted") or "Previously painted"),
+            "area_m2":   _safe_float(row.get("area_m2", 0)),
+            "job_notes": str(row.get("job_notes", "") or ""),
+        })
+    return [sections[k] for k in sorted(sections.keys())]
+
+
+def get_additional_lines(job_no: str) -> list:
+    """Return additional_sections list for the given job from the DB."""
+    if not is_configured():
+        return []
+    df = _read_dataframe("Additional_Lines")
+    if df.empty:
+        return []
+    df = df[df["job_no"].astype(str).str.strip() == str(job_no).strip()]
+    if df.empty:
+        return []
+    if "sort_order" in df.columns:
+        try:
+            df = df.sort_values("sort_order")
+        except Exception:
+            pass
+
+    def _safe_float(val, default=0.0):
+        try:
+            return float(val) if val not in (None, "", "None") else default
+        except (ValueError, TypeError):
+            return default
+
+    return [
+        {
+            "item":          str(row.get("item", "") or ""),
+            "duration_days": _safe_float(row.get("duration_days", 0)),
+            "km":            _safe_float(row.get("km", 0)),
+            "liters":        _safe_float(row.get("liters", 0)),
         }
         for _, row in df.iterrows()
     ]

@@ -164,6 +164,14 @@ def _require_app_password():
 
 _require_app_password()
 
+# Cached line-item loaders — defined here so they are available to the
+# standalone page below (which calls st.stop() before the main cached-
+# loader block further down the file).
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_paint_lines(job_no: str): return db_sheets.get_paint_lines(job_no)
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_additional_lines(job_no: str): return db_sheets.get_additional_lines(job_no)
+
 # ---- Standalone quote details page (new-tab auth flow) ----
 _standalone_quote = st.session_state.get("_standalone_quote", "")
 if _standalone_quote:
@@ -235,6 +243,130 @@ if _standalone_quote:
                 except Exception:
                     _sa_md = str(_sa_row.get("man_days_available", ""))
 
+                # ---- Load line items (used by both read-only view and export buttons) ----
+                _sa_paint_sections = []
+                _sa_additional_sections = []
+                try:
+                    _sa_paint_sections = _cached_paint_lines(str(_standalone_quote))
+                except Exception:
+                    pass
+                try:
+                    _sa_additional_sections = _cached_additional_lines(str(_standalone_quote))
+                except Exception:
+                    pass
+
+                # Build full quote context with calculated costs
+                _SA_METHOD_RATES = {"Previously painted": 10, "New Build": 20}
+                _SA_CLASS_MULTS  = {"A": 1.0, "B": 1.15, "C": 1.25}
+                try:
+                    _sa_item_rates, _sa_item_units, _, _ = _cached_custom_rates()
+                except Exception:
+                    _sa_item_rates, _sa_item_units = {}, {}
+
+                # Build additional-rates lookup from the cached DB rates
+                # (avoids forward-references to functions defined later in the file)
+                _sa_add_rates: dict = {}
+                try:
+                    for _sa_ar in (_cached_additional_rates() or []):
+                        _sa_ar_item = str(_sa_ar.get("item", "") or "")
+                        _sa_ar_unit = str(_sa_ar.get("rate_unit", "") or "")
+                        _sa_ar_val  = float(_sa_ar.get("rate_value", 0) or 0)
+                        if _sa_ar_item not in _sa_add_rates:
+                            _sa_add_rates[_sa_ar_item] = {}
+                        if _sa_ar_unit == "per day":
+                            _sa_add_rates[_sa_ar_item]["per_day"] = _sa_ar_val
+                        elif _sa_ar_unit == "per km":
+                            _sa_add_rates[_sa_ar_item]["per_km"] = _sa_ar_val
+                        elif _sa_ar_unit == "per 1000 liters":
+                            _sa_add_rates[_sa_ar_item]["per_1000_liters"] = _sa_ar_val
+                        elif _sa_ar_unit == "per litre":
+                            _sa_add_rates[_sa_ar_item]["per_litre"] = _sa_ar_val
+                except Exception:
+                    pass
+
+                def _sa_add_sec_cost(sec):
+                    rate = _sa_add_rates.get(sec.get("item", ""), {})
+                    if rate.get("per_1000_liters"):
+                        return (float(sec.get("liters", 0) or 0) / 1000.0) * rate["per_1000_liters"]
+                    if rate.get("per_litre"):
+                        return float(sec.get("liters", 0) or 0) * rate["per_litre"]
+                    return (float(sec.get("duration_days", 0) or 0) * rate.get("per_day", 0)
+                            + float(sec.get("km", 0) or 0) * rate.get("per_km", 0))
+
+                def _sa_add_sec_row(sec):
+                    cost = _sa_add_sec_cost(sec)
+                    item = sec.get("item", "")
+                    if item == "Water Procurement":
+                        return {"description": item,
+                                "type": f"{int(sec.get('liters', 0) or 0)} liters",
+                                "amount": f"R{cost:,.2f}"}
+                    return {"description": item,
+                            "type": f"{sec.get('duration_days', 0)} days",
+                            "amount": sec.get("km", 0)}
+
+                # Flatten paint sections (inline — avoids forward-reference to _flatten_paint_sections)
+                _sa_paint_specs   = []
+                _sa_total_mat     = 0.0
+                _sa_total_lab_calc = 0.0
+                for _sa_sec_i in _sa_paint_sections:
+                    for _sa_itm in (_sa_sec_i.get("items") or []):
+                        _sa_flat = {
+                            "paint_class":      _sa_sec_i.get("paint_class", "A"),
+                            "type":             _sa_sec_i.get("type", "Exterior"),
+                            "area_description": _sa_sec_i.get("area_description", ""),
+                            **_sa_itm,
+                        }
+                        try:
+                            _sa_area = float(_sa_flat.get("area_m2") or 0)
+                        except (TypeError, ValueError):
+                            _sa_area = 0.0
+                        if not (_sa_area > 0):  # skips 0, negative, and NaN
+                            continue
+                        _sa_cls  = _sa_flat.get("paint_class", "A")
+                        _sa_mult = _SA_CLASS_MULTS.get(_sa_cls, 1.0)
+                        _sa_r    = _sa_item_rates.get(_sa_flat.get("item", ""), {"material": 0, "labour": 0})
+                        _sa_mmet = _SA_METHOD_RATES.get(_sa_flat.get("method", ""), 0) * _sa_mult
+                        _sa_mat  = round(_sa_area * (_sa_r["material"] * _sa_mult + _sa_mmet), 2)
+                        _sa_lab  = round(_sa_area * _sa_r["labour"] * _sa_mult, 2)
+                        _sa_total_mat += _sa_mat
+                        _sa_total_lab_calc += _sa_lab
+                        _sa_paint_specs.append({
+                            "type":             _sa_flat.get("type", ""),
+                            "item":             _sa_flat.get("item", ""),
+                            "method":           _sa_flat.get("method", ""),
+                            "converted":        str(int(_sa_area)),
+                            "unit":             _sa_item_units.get(_sa_flat.get("item", ""), "m²"),
+                            "class":            _sa_cls,
+                            "area_description": _sa_flat.get("area_description", ""),
+                            "job_notes":        _sa_flat.get("job_notes", ""),
+                            "materialcost":     f"R{_sa_mat:,.2f}",
+                            "labourcost":       f"R{_sa_lab:,.2f}",
+                        })
+
+                _sa_add_costs = [_sa_add_sec_row(s) for s in _sa_additional_sections]
+                _sa_add_total = sum(_sa_add_sec_cost(s) for s in _sa_additional_sections)
+                _sa_grand_total = _sa_total_mat + _sa_total_lab_calc + _sa_add_total
+                _sa_labour_val  = float(_sa_row.get("total_labour", 0) or 0)
+
+                _sa_quote_context = {
+                    "clientname":       str(_sa_row.get("client", "") or ""),
+                    "clientaddress":    str(_sa_row.get("address", "") or ""),
+                    "clientphone":      str(_sa_row.get("phone", "") or ""),
+                    "clientemail":      str(_sa_row.get("email", "") or ""),
+                    "areaManagerName":  str(_sa_row.get("area_manager", "") or ""),
+                    "areaManagerPhone": "",
+                    "areaManagerEmail": "",
+                    "quotedate":        _sa_qdate.strftime("%Y-%m-%d") if pd.notna(_sa_qdate) else "",
+                    "quotenumber":      str(_sa_row.get("job_no", "") or ""),
+                    "paint_specs":      _sa_paint_specs,
+                    "additional_costs": _sa_add_costs,
+                    "materialtotal":    f"R{_sa_total_mat:,.2f}" if _sa_paint_specs else "—",
+                    "labourtotal":      f"R{_sa_total_lab_calc:,.2f}" if _sa_paint_specs else f"R{_sa_labour_val:,.2f}",
+                    "additionaltotal":  f"R{_sa_add_total:,.2f}" if _sa_additional_sections else "—",
+                    "grandtotal":       f"R{_sa_grand_total:,.2f}" if _sa_paint_specs else f"R{_sa_labour_val:,.2f}",
+                    "grandtotal50":     f"R{(_sa_grand_total if _sa_paint_specs else _sa_labour_val) * 0.5:,.2f}",
+                }
+
                 if not _sa_editing:
                     # ---- Read-only view ----
                     _sa_c1, _sa_c2 = st.columns(2)
@@ -252,6 +384,83 @@ if _standalone_quote:
                         st.write(_sa_saved.strftime("%Y-%m-%d %H:%M") if pd.notna(_sa_saved) else "—")
                         st.markdown("**Labour Total**"); st.write(_sa_labour)
                         st.markdown("**Man-Days**");     st.write(_sa_md)
+
+                    # ---- Action buttons ----
+                    st.divider()
+                    _sa_act_word, _sa_act_email = st.columns(2)
+
+                    with _sa_act_word:
+                        if st.button("📄 Export to Word", key="sa_word_btn",
+                                     type="primary", use_container_width=True):
+                            try:
+                                import os, io as _io
+                                from docxtpl import DocxTemplate as _DocxTemplate
+                                if not os.path.exists("template.docx"):
+                                    st.error("❌ template.docx not found. Upload it to the app root.")
+                                else:
+                                    _sa_tpl = _DocxTemplate("template.docx")
+                                    _sa_tpl.render(_sa_quote_context)
+                                    _sa_bio = _io.BytesIO()
+                                    _sa_tpl.save(_sa_bio)
+                                    _sa_bio.seek(0)
+                                    st.download_button(
+                                        "⬇️ Download Quote.docx",
+                                        data=_sa_bio.getvalue(),
+                                        file_name=_download_filename(
+                                            _sa_quote_context["quotenumber"],
+                                            _sa_quote_context["clientname"],
+                                            "docx", tab_number=1,
+                                        ),
+                                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                        use_container_width=True,
+                                        key="sa_word_dl_btn",
+                                    )
+                                    st.success("✅ Word document ready.")
+                            except Exception as _sa_word_err:
+                                st.error(f"Export error: {_sa_word_err}")
+
+                    with _sa_act_email:
+                        if st.button("📧 Email Quote to Client (PDF)", key="sa_email_btn",
+                                     type="secondary", use_container_width=True):
+                            try:
+                                _sa_client_email = str(_sa_row.get("email", "") or "").strip()
+                                if not _sa_client_email:
+                                    st.error("No email address on record for this client.")
+                                else:
+                                    _sa_email_cfg = get_email_config()
+                                    if not _sa_email_cfg:
+                                        st.error("❌ SMTP not configured. Add email_config.txt or Streamlit secrets.")
+                                    else:
+                                        _sa_pdf_bio = generate_quote_pdf(_sa_quote_context)
+                                        _sa_subject = (
+                                            f"Pro Paint Teams Quote {_sa_quote_context['quotenumber']}"
+                                            f" – {_sa_quote_context['clientname']}"
+                                        )
+                                        _sa_body = (
+                                            f"Dear {_sa_quote_context['clientname']},\n\n"
+                                            f"Please find attached your quotation "
+                                            f"(Quote {_sa_quote_context['quotenumber']}).\n\n"
+                                            f"The quote is valid for 14 days. Should you have any questions "
+                                            f"or wish to proceed, please don't hesitate to contact us.\n\n"
+                                            f"Best regards,\n"
+                                            f"{_sa_quote_context['areaManagerName']}\n"
+                                            f"Pro Paint Teams"
+                                        )
+                                        _sa_filename = _download_filename(
+                                            _sa_quote_context["quotenumber"],
+                                            _sa_quote_context["clientname"],
+                                            "pdf", tab_number=1,
+                                        )
+                                        _sa_ok, _sa_msg = send_quote_email(
+                                            _sa_client_email, _sa_subject, _sa_body,
+                                            _sa_pdf_bio, _sa_filename, _sa_email_cfg,
+                                        )
+                                        if _sa_ok:
+                                            st.success(_sa_msg)
+                                        else:
+                                            st.error(_sa_msg)
+                            except Exception as _sa_email_err:
+                                st.error(f"Email error: {_sa_email_err}")
 
 
                 else:
@@ -408,6 +617,203 @@ if _standalone_quote:
                                     "Cancel", type="secondary",
                                     use_container_width=True, on_click=_sa_on_cancel)
 
+                # ================================================================
+                # LINE ITEMS — paint spec + additional costs editors
+                # Always shown below the details/edit section.
+                # Uses the same two-phase save pattern as Master Rates.
+                # ================================================================
+
+                def _sa_paint_to_df(sections):
+                    rows = []
+                    for si, sec in enumerate(sections):
+                        for itm in sec.get("items", []):
+                            rows.append({
+                                "Section #":       si + 1,
+                                "Class":           sec.get("paint_class", "A"),
+                                "Type":            sec.get("type", "Exterior"),
+                                "Area Description": sec.get("area_description", ""),
+                                "Item":            itm.get("item", ""),
+                                "Method":          itm.get("method", "Previously painted"),
+                                "Qty (m²)":        float(itm.get("area_m2", 0) or 0),
+                                "Notes":           itm.get("job_notes", ""),
+                            })
+                    _cols = ["Section #","Class","Type","Area Description","Item","Method","Qty (m²)","Notes"]
+                    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=_cols)
+
+                def _sa_df_to_paint_sections(df):
+                    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+                        return []
+                    sections: dict = {}
+                    for _, row in df.iterrows():
+                        si = max(0, int(float(row.get("Section #", 1) or 1)) - 1)
+                        if si not in sections:
+                            sections[si] = {
+                                "paint_class":      str(row.get("Class", "A") or "A"),
+                                "type":             str(row.get("Type", "Exterior") or "Exterior"),
+                                "area_description": str(row.get("Area Description", "") or ""),
+                                "items":            [],
+                            }
+                        sections[si]["items"].append({
+                            "item":      str(row.get("Item", "") or ""),
+                            "method":    str(row.get("Method", "Previously painted") or "Previously painted"),
+                            "area_m2":   float(row.get("Qty (m²)", 0) or 0),
+                            "job_notes": str(row.get("Notes", "") or ""),
+                        })
+                    return [sections[k] for k in sorted(sections.keys())]
+
+                def _sa_add_to_df(sections):
+                    rows = [{"Item": s.get("item",""), "Days": float(s.get("duration_days",0) or 0),
+                              "KM": float(s.get("km",0) or 0), "Liters": float(s.get("liters",0) or 0)}
+                            for s in sections]
+                    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["Item","Days","KM","Liters"])
+
+                def _sa_df_to_add_sections(df):
+                    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+                        return []
+                    return [{"item": str(r.get("Item","") or ""),
+                              "duration_days": float(r.get("Days",0) or 0),
+                              "km": float(r.get("KM",0) or 0),
+                              "liters": float(r.get("Liters",0) or 0)}
+                            for _, r in df.iterrows()]
+
+                st.divider()
+
+                # --- Paint Lines ---
+                st.subheader("🎨 Paint Line Items")
+                _sa_pl_action = st.session_state.get("_sa_pl_action")
+                _sa_pl_busy   = _sa_pl_action is not None
+                _sa_pl_ok   = st.session_state.pop("_sa_pl_success_msg", None)
+                _sa_pl_fail = st.session_state.pop("_sa_pl_error_msg", None)
+                if _sa_pl_ok:   st.success(_sa_pl_ok)
+                if _sa_pl_fail: st.error(_sa_pl_fail)
+
+                with st.form("sa_paint_lines_form", clear_on_submit=False, border=False):
+                    _sa_pl_df_current = st.session_state.get(
+                        "_sa_pl_df",
+                        _sa_paint_to_df(_sa_paint_sections),
+                    )
+                    _sa_pl_edited = st.data_editor(
+                        _sa_pl_df_current,
+                        num_rows="dynamic", hide_index=True,
+                        key="_sa_pl_editor",
+                        disabled=_sa_pl_busy,
+                        column_config={
+                            "Section #":  st.column_config.NumberColumn("Section #", min_value=1, step=1),
+                            "Class":      st.column_config.SelectboxColumn("Class",  options=["A","B","C"]),
+                            "Type":       st.column_config.SelectboxColumn("Type",   options=["Interior","Exterior"]),
+                            "Method":     st.column_config.SelectboxColumn("Method", options=["Previously painted","New Build"]),
+                            "Qty (m²)":   st.column_config.NumberColumn("Qty (m²)", min_value=0.0, step=0.1, format="%.2f"),
+                        },
+                    )
+                    _sa_pl_save_col, _sa_pl_cancel_col = st.columns(2)
+                    _sa_pl_save_clicked = _sa_pl_save_col.form_submit_button(
+                        "⏳ Saving…" if _sa_pl_action == "save" else "💾 Save paint lines",
+                        type="primary", use_container_width=True, disabled=_sa_pl_busy,
+                    )
+                    _sa_pl_cancel_clicked = _sa_pl_cancel_col.form_submit_button(
+                        "⏳ Discarding…" if _sa_pl_action == "cancel" else "❌ Discard changes",
+                        use_container_width=True, disabled=_sa_pl_busy,
+                    )
+
+                if _sa_pl_action == "save":
+                    _sa_pl_pending = st.session_state.pop("_sa_pl_pending", None)
+                    if _sa_pl_pending is not None:
+                        with st.spinner("Saving paint line items…"):
+                            try:
+                                _sa_new_secs = _sa_df_to_paint_sections(_sa_pl_pending)
+                                db_sheets.save_paint_lines(str(_standalone_quote), _sa_new_secs)
+                                _cached_paint_lines.clear()
+                                st.session_state.pop("_sa_pl_df", None)
+                                st.session_state.pop("_sa_pl_action", None)
+                                st.session_state["_sa_pl_success_msg"] = "✅ Paint lines saved."
+                                st.rerun()
+                            except Exception as _sa_pl_err:
+                                st.session_state["_sa_pl_df"] = _sa_pl_pending
+                                st.session_state.pop("_sa_pl_action", None)
+                                st.session_state["_sa_pl_error_msg"] = f"Save failed — {_sa_pl_err}"
+                                st.rerun()
+                    else:
+                        st.session_state.pop("_sa_pl_action", None)
+                elif _sa_pl_action == "cancel":
+                    st.session_state.pop("_sa_pl_df", None)
+                    st.session_state.pop("_sa_pl_action", None)
+                    st.rerun()
+                elif _sa_pl_save_clicked:
+                    st.session_state["_sa_pl_pending"] = _sa_pl_edited.copy()
+                    st.session_state["_sa_pl_action"] = "save"
+                    st.rerun()
+                elif _sa_pl_cancel_clicked:
+                    st.session_state["_sa_pl_action"] = "cancel"
+                    st.rerun()
+
+                st.divider()
+
+                # --- Additional Lines ---
+                st.subheader("➕ Additional Costs")
+                _sa_al_action = st.session_state.get("_sa_al_action")
+                _sa_al_busy   = _sa_al_action is not None
+                _sa_al_ok   = st.session_state.pop("_sa_al_success_msg", None)
+                _sa_al_fail = st.session_state.pop("_sa_al_error_msg", None)
+                if _sa_al_ok:   st.success(_sa_al_ok)
+                if _sa_al_fail: st.error(_sa_al_fail)
+
+                with st.form("sa_add_lines_form", clear_on_submit=False, border=False):
+                    _sa_al_df_current = st.session_state.get(
+                        "_sa_al_df",
+                        _sa_add_to_df(_sa_additional_sections),
+                    )
+                    _sa_al_edited = st.data_editor(
+                        _sa_al_df_current,
+                        num_rows="dynamic", hide_index=True,
+                        key="_sa_al_editor",
+                        disabled=_sa_al_busy,
+                        column_config={
+                            "Days":   st.column_config.NumberColumn("Days",   min_value=0, step=1),
+                            "KM":     st.column_config.NumberColumn("KM",     min_value=0, step=10),
+                            "Liters": st.column_config.NumberColumn("Liters", min_value=0, step=100.0, format="%.0f"),
+                        },
+                    )
+                    _sa_al_save_col, _sa_al_cancel_col = st.columns(2)
+                    _sa_al_save_clicked = _sa_al_save_col.form_submit_button(
+                        "⏳ Saving…" if _sa_al_action == "save" else "💾 Save additional lines",
+                        type="primary", use_container_width=True, disabled=_sa_al_busy,
+                    )
+                    _sa_al_cancel_clicked = _sa_al_cancel_col.form_submit_button(
+                        "⏳ Discarding…" if _sa_al_action == "cancel" else "❌ Discard changes",
+                        use_container_width=True, disabled=_sa_al_busy,
+                    )
+
+                if _sa_al_action == "save":
+                    _sa_al_pending = st.session_state.pop("_sa_al_pending", None)
+                    if _sa_al_pending is not None:
+                        with st.spinner("Saving additional lines…"):
+                            try:
+                                _sa_new_add = _sa_df_to_add_sections(_sa_al_pending)
+                                db_sheets.save_additional_lines(str(_standalone_quote), _sa_new_add)
+                                _cached_additional_lines.clear()
+                                st.session_state.pop("_sa_al_df", None)
+                                st.session_state.pop("_sa_al_action", None)
+                                st.session_state["_sa_al_success_msg"] = "✅ Additional lines saved."
+                                st.rerun()
+                            except Exception as _sa_al_err:
+                                st.session_state["_sa_al_df"] = _sa_al_pending
+                                st.session_state.pop("_sa_al_action", None)
+                                st.session_state["_sa_al_error_msg"] = f"Save failed — {_sa_al_err}"
+                                st.rerun()
+                    else:
+                        st.session_state.pop("_sa_al_action", None)
+                elif _sa_al_action == "cancel":
+                    st.session_state.pop("_sa_al_df", None)
+                    st.session_state.pop("_sa_al_action", None)
+                    st.rerun()
+                elif _sa_al_save_clicked:
+                    st.session_state["_sa_al_pending"] = _sa_al_edited.copy()
+                    st.session_state["_sa_al_action"] = "save"
+                    st.rerun()
+                elif _sa_al_cancel_clicked:
+                    st.session_state["_sa_al_action"] = "cancel"
+                    st.rerun()
+
     st.stop()
 
 st.title("Pro Paint Teams Job/Site Worksheet App")
@@ -505,6 +911,8 @@ def _cached_job_history():
 def _cached_custom_rates(): return db_sheets.load_custom_rates()
 @st.cache_data(ttl=120, show_spinner=False)
 def _cached_additional_rates(): return db_sheets.load_custom_additional_rates()
+# _cached_paint_lines / _cached_additional_lines are defined above the
+# standalone page block (before st.stop()) so they are always available.
 
 def _clear_cloud_cache():
     _cached_clients.clear()
@@ -515,6 +923,8 @@ def _clear_cloud_cache():
     _cached_job_history.clear()
     _cached_custom_rates.clear()
     _cached_additional_rates.clear()
+    _cached_paint_lines.clear()
+    _cached_additional_lines.clear()
 
 def _clear_jobs_cache():
     """Clear only job/client caches — leave rates untouched."""
@@ -524,6 +934,8 @@ def _clear_jobs_cache():
     _cached_attendance.clear()
     _cached_bonus_log.clear()
     _cached_job_history.clear()
+    _cached_paint_lines.clear()
+    _cached_additional_lines.clear()
 
 def _clear_rates_cache():
     """Clear only rates caches — leave jobs/clients untouched."""
@@ -1421,6 +1833,14 @@ with tab_master:
     _mr_action = st.session_state.get("_mr_action")  # "save" | "reset" | "cancel" | None
     _mr_busy = _mr_action is not None
 
+    # Persistent feedback from the previous save/reset/cancel (survives the rerun)
+    _mr_ok = st.session_state.pop("_mr_success_msg", None)
+    _mr_fail = st.session_state.pop("_mr_error_msg", None)
+    if _mr_ok:
+        st.success(_mr_ok)
+    if _mr_fail:
+        st.error(_mr_fail)
+
     with st.form("master_rates_form", clear_on_submit=False, border=False):
         edited_df = st.data_editor(
             st.session_state.master_rates_df,
@@ -1462,11 +1882,18 @@ with tab_master:
                     st.session_state.rates_version += 1
                     _clear_streamlit_widget_key(_MASTER_RATES_EDITOR_KEY)
                     st.session_state.pop("_mr_action", None)
-                    st.success("✅ Paint specification rates saved permanently!")
+                    st.session_state["_mr_success_msg"] = "✅ Paint specification rates saved permanently!"
                     st.rerun()
                 except Exception as _mr_err:
+                    # Restore the user's edits so they can correct and retry
+                    st.session_state.master_rates_df = sorted_df
+                    _clear_streamlit_widget_key(_MASTER_RATES_EDITOR_KEY)
                     st.session_state.pop("_mr_action", None)
-                    st.error(f"Could not save rates — {_sheets_error_msg(_mr_err)}")
+                    st.session_state["_mr_error_msg"] = f"Could not save rates — {_sheets_error_msg(_mr_err)}"
+                    st.rerun()
+        else:
+            # Staging data missing — unstick the form
+            st.session_state.pop("_mr_action", None)
     elif _mr_action == "reset":
         _mr, _mu, _mn = _df_to_rate_dicts(pd.DataFrame(DEFAULT_MASTER_RATES))
         with st.spinner("Resetting paint rates to factory defaults…"):
@@ -1479,11 +1906,12 @@ with tab_master:
                 st.session_state.rates_version += 1
                 _clear_streamlit_widget_key(_MASTER_RATES_EDITOR_KEY)
                 st.session_state.pop("_mr_action", None)
-                st.success("Factory default paint rates restored.")
+                st.session_state["_mr_success_msg"] = "Factory default paint rates restored."
                 st.rerun()
             except Exception as _mr_err:
                 st.session_state.pop("_mr_action", None)
-                st.error(f"Could not reset rates — {_sheets_error_msg(_mr_err)}")
+                st.session_state["_mr_error_msg"] = f"Could not reset rates — {_sheets_error_msg(_mr_err)}"
+                st.rerun()
     elif _mr_action == "cancel":
         with st.spinner("Discarding changes…"):
             st.session_state.master_rates_df = _prepare_master_rates_df(_load_master_rates_dataframe())
@@ -1509,6 +1937,14 @@ with tab_master:
 
     _ar_action = st.session_state.get("_ar_action")  # "save" | "reset" | "cancel" | None
     _ar_busy = _ar_action is not None
+
+    # Persistent feedback from the previous save/reset/cancel (survives the rerun)
+    _ar_ok = st.session_state.pop("_ar_success_msg", None)
+    _ar_fail = st.session_state.pop("_ar_error_msg", None)
+    if _ar_ok:
+        st.success(_ar_ok)
+    if _ar_fail:
+        st.error(_ar_fail)
 
     with st.form("master_additional_rates_form", clear_on_submit=False, border=False):
         edited_additional_df = st.data_editor(
@@ -1547,11 +1983,18 @@ with tab_master:
                     st.session_state.rates_version += 1
                     _clear_streamlit_widget_key(_MASTER_ADDITIONAL_RATES_EDITOR_KEY)
                     st.session_state.pop("_ar_action", None)
-                    st.success("✅ Additional rates saved permanently!")
+                    st.session_state["_ar_success_msg"] = "✅ Additional rates saved permanently!"
                     st.rerun()
                 except Exception as _ar_err:
+                    # Restore the user's edits so they can correct and retry
+                    st.session_state.master_additional_rates_df = sorted_additional_df
+                    _clear_streamlit_widget_key(_MASTER_ADDITIONAL_RATES_EDITOR_KEY)
                     st.session_state.pop("_ar_action", None)
-                    st.error(f"Could not save additional rates — {_sheets_error_msg(_ar_err)}")
+                    st.session_state["_ar_error_msg"] = f"Could not save additional rates — {_sheets_error_msg(_ar_err)}"
+                    st.rerun()
+        else:
+            # Staging data missing — unstick the form
+            st.session_state.pop("_ar_action", None)
     elif _ar_action == "reset":
         _ar_default = _prepare_master_additional_rates_df(pd.DataFrame(DEFAULT_MASTER_ADDITIONAL_RATES))
         with st.spinner("Resetting additional rates to factory defaults…"):
@@ -1563,11 +2006,12 @@ with tab_master:
                 st.session_state.rates_version += 1
                 _clear_streamlit_widget_key(_MASTER_ADDITIONAL_RATES_EDITOR_KEY)
                 st.session_state.pop("_ar_action", None)
-                st.success("Factory default additional rates restored.")
+                st.session_state["_ar_success_msg"] = "Factory default additional rates restored."
                 st.rerun()
             except Exception as _ar_err:
                 st.session_state.pop("_ar_action", None)
-                st.error(f"Could not reset additional rates — {_sheets_error_msg(_ar_err)}")
+                st.session_state["_ar_error_msg"] = f"Could not reset additional rates — {_sheets_error_msg(_ar_err)}"
+                st.rerun()
     elif _ar_action == "cancel":
         with st.spinner("Discarding changes…"):
             st.session_state.master_additional_rates_df = _prepare_master_additional_rates_df(
@@ -1792,7 +2236,7 @@ with tab_quote:
                     section["items"].pop(j)
                     st.rerun()
 
-            if st.button("➕ Add Item to Section", key=f"add_item_{i}"):
+            if st.button("➕ Add Item to Section", key=f"add_paint_item_{i}"):
                 section["items"].append(_default_paint_item())
                 st.rerun()
 
@@ -2021,6 +2465,14 @@ Pro Paint Teams"""
     if DB_READY:
         _saving_quote = st.session_state.get("_saving_quote", False)
 
+        # Persistent feedback from the previous save (survives the rerun)
+        _sq_ok = st.session_state.pop("_quote_save_success_msg", None)
+        _sq_fail = st.session_state.pop("_quote_save_error_msg", None)
+        if _sq_ok:
+            st.success(_sq_ok)
+        if _sq_fail:
+            st.error(_sq_fail)
+
         def _on_save_quote_click():
             st.session_state["_saving_quote"] = True
 
@@ -2037,12 +2489,50 @@ Pro Paint Teams"""
                     db_sheets.save_job(job_no=job_no, job_name=client, client=client,
                                        area_manager=area_manager, team_leader="", start_date=quote_date,
                                        total_labour=total_labour, man_days_available=0)
+                    db_sheets.save_paint_lines(job_no, st.session_state.paint_sections)
+                    db_sheets.save_additional_lines(job_no, st.session_state.additional_sections)
                     _clear_jobs_cache()
                     st.session_state["_saving_quote"] = False
-                    st.success(f"✅ Quote **{job_no}** saved!")
+                    st.session_state["_quote_save_success_msg"] = f"✅ Quote **{job_no}** saved!"
+                    st.rerun()
                 except Exception as e:
                     st.session_state["_saving_quote"] = False
-                    st.error(f"Save failed — {_sheets_error_msg(e)}")
+                    st.session_state["_quote_save_error_msg"] = f"Save failed — {_sheets_error_msg(e)}"
+                    st.rerun()
+
+    if st.button("🗑️ Clear all fields", key="clear_quote_btn", type="secondary", width="stretch"):
+        # Clear per-section widget state so fields don't bleed into the fresh form
+        _cur_version = st.session_state.get("rates_version", 0)
+        for _ci, _cs in enumerate(st.session_state.get("paint_sections", [])):
+            for _ck in (f"class_{_ci}", f"type_{_ci}", f"desc_{_ci}"):
+                _clear_streamlit_widget_key(_ck)
+            for _cj in range(len(_cs.get("items", []))):
+                for _ck in (
+                    f"item_{_ci}_{_cj}_v{_cur_version}",
+                    f"method_{_ci}_{_cj}",
+                    f"area_m2_{_ci}_{_cj}",
+                ):
+                    _clear_streamlit_widget_key(_ck)
+        for _ci in range(len(st.session_state.get("additional_sections", []))):
+            for _ck in (f"add_item_{_ci}", f"add_liters_{_ci}", f"add_dur_{_ci}", f"add_km_{_ci}"):
+                _clear_streamlit_widget_key(_ck)
+        # Clear top-level quote fields
+        for _ck in ("client", "client_phone", "client_email", "client_address", "client_select", "job_no", "quote_date"):
+            _clear_streamlit_widget_key(_ck)
+        st.session_state.client = ""
+        st.session_state.client_phone = ""
+        st.session_state.client_email = ""
+        st.session_state.client_address = ""
+        st.session_state.quote_date = date.today()
+        st.session_state.job_no = get_next_quote_number(st.session_state.get("area_code", "CAW"))
+        # Reset sections to a single blank section
+        st.session_state.paint_sections = [{
+            "paint_class": "A", "type": "Exterior", "area_description": "",
+            "items": [{"item": item_options[0] if item_options else "Walls",
+                       "method": "Previously painted", "area_m2": 0.0, "job_notes": ""}],
+        }]
+        st.session_state.additional_sections = []
+        st.rerun()
 
     # Data bridge for other tabs — scalar writes are cheap, always update
     st.session_state.total_material = total_material
