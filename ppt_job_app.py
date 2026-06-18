@@ -1440,20 +1440,21 @@ with tab_master:
     if save_clicked:
         sorted_df = _prepare_master_rates_df(edited_df)
         _mr, _mu, _mn = _df_to_rate_dicts(sorted_df)
-        try:
-            db_sheets.save_custom_rates(_mr, _mu, _mn)
-            _clear_rates_cache()
-            st.session_state.master_rates_df = sorted_df
-            st.session_state.item_rates_df = sorted_df.copy()
-            st.session_state.ITEM_RATES = _mr
-            st.session_state.ITEM_UNITS = _mu
-            st.session_state.DEFAULT_JOB_NOTES = _mn
-            st.session_state.rates_version += 1
-            _clear_streamlit_widget_key(_MASTER_RATES_EDITOR_KEY)
-            st.success("✅ Paint specification rates saved permanently!")
-            st.rerun()
-        except Exception as _mr_err:
-            st.error(f"Could not save rates — {_sheets_error_msg(_mr_err)}")
+        with st.spinner("Saving paint specification rates…"):
+            try:
+                db_sheets.save_custom_rates(_mr, _mu, _mn)
+                _clear_rates_cache()
+                st.session_state.master_rates_df = sorted_df
+                st.session_state.item_rates_df = sorted_df.copy()
+                st.session_state.ITEM_RATES = _mr
+                st.session_state.ITEM_UNITS = _mu
+                st.session_state.DEFAULT_JOB_NOTES = _mn
+                st.session_state.rates_version += 1
+                _clear_streamlit_widget_key(_MASTER_RATES_EDITOR_KEY)
+                st.success("✅ Paint specification rates saved permanently!")
+                st.rerun()
+            except Exception as _mr_err:
+                st.error(f"Could not save rates — {_sheets_error_msg(_mr_err)}")
 
     if reset_clicked:
         _mr, _mu, _mn = _df_to_rate_dicts(pd.DataFrame(DEFAULT_MASTER_RATES))
@@ -1503,17 +1504,18 @@ with tab_master:
 
     if add_save_clicked:
         sorted_additional_df = _prepare_master_additional_rates_df(edited_additional_df)
-        try:
-            db_sheets.save_custom_additional_rates(_additional_rates_df_to_db_rows(sorted_additional_df))
-            _clear_rates_cache()
-            st.session_state.master_additional_rates_df = sorted_additional_df
-            _update_session_additional_rates_from_df(sorted_additional_df)
-            st.session_state.rates_version += 1
-            _clear_streamlit_widget_key(_MASTER_ADDITIONAL_RATES_EDITOR_KEY)
-            st.success("✅ Additional rates saved permanently!")
-            st.rerun()
-        except Exception as _ar_err:
-            st.error(f"Could not save additional rates — {_sheets_error_msg(_ar_err)}")
+        with st.spinner("Saving additional rates…"):
+            try:
+                db_sheets.save_custom_additional_rates(_additional_rates_df_to_db_rows(sorted_additional_df))
+                _clear_rates_cache()
+                st.session_state.master_additional_rates_df = sorted_additional_df
+                _update_session_additional_rates_from_df(sorted_additional_df)
+                st.session_state.rates_version += 1
+                _clear_streamlit_widget_key(_MASTER_ADDITIONAL_RATES_EDITOR_KEY)
+                st.success("✅ Additional rates saved permanently!")
+                st.rerun()
+            except Exception as _ar_err:
+                st.error(f"Could not save additional rates — {_sheets_error_msg(_ar_err)}")
 
     if add_reset_clicked:
         default_additional_df = _prepare_master_additional_rates_df(
@@ -1971,15 +1973,16 @@ Pro Paint Teams"""
     st.divider()
     if DB_READY:
         if st.button("💾 Save Quote & Client to Cloud Database", type="primary", width="stretch", key="save_quote_btn"):
-            try:
-                db_sheets.save_client(client, client_phone, client_email, client_address)
-                db_sheets.save_job(job_no=job_no, job_name=client, client=client,
-                                   area_manager=area_manager, team_leader="", start_date=quote_date,
-                                   total_labour=total_labour, man_days_available=0)
-                _clear_jobs_cache()
-                st.success(f"✅ Quote **{job_no}** saved!")
-            except Exception as e:
-                st.error(f"Save failed — {_sheets_error_msg(e)}")
+            with st.spinner("Saving quote to cloud…"):
+                try:
+                    db_sheets.save_client(client, client_phone, client_email, client_address)
+                    db_sheets.save_job(job_no=job_no, job_name=client, client=client,
+                                       area_manager=area_manager, team_leader="", start_date=quote_date,
+                                       total_labour=total_labour, man_days_available=0)
+                    _clear_jobs_cache()
+                    st.success(f"✅ Quote **{job_no}** saved!")
+                except Exception as e:
+                    st.error(f"Save failed — {_sheets_error_msg(e)}")
 
     # Data bridge for other tabs
     st.session_state.total_material = total_material

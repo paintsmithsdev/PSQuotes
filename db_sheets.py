@@ -13,7 +13,12 @@ import pandas as pd
 from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.service_account import Credentials
-from gspread.exceptions import APIError, CellNotFound
+from gspread.exceptions import APIError
+try:
+    from gspread.exceptions import CellNotFound  # removed in gspread ≥ 6; find() returns None instead
+except ImportError:
+    class CellNotFound(Exception):  # type: ignore[no-redef]
+        pass
 
 T = TypeVar("T")
 
