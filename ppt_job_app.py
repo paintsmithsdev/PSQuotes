@@ -1417,6 +1417,10 @@ with tab_master:
     st.subheader("Paint Specification Rates")
 
     # Form batches all table edits: no script rerun until a submit button is pressed.
+    # Two-phase pattern: click stages the action, next rerun shows disabled UI + runs the op
+    _mr_action = st.session_state.get("_mr_action")  # "save" | "reset" | "cancel" | None
+    _mr_busy = _mr_action is not None
+
     with st.form("master_rates_form", clear_on_submit=False, border=False):
         edited_df = st.data_editor(
             st.session_state.master_rates_df,
@@ -1425,62 +1429,86 @@ with tab_master:
             hide_index=True,
             key=_MASTER_RATES_EDITOR_KEY,
             column_config=_master_rates_column_config(),
+            disabled=_mr_busy,
         )
         btn_save, btn_reset, btn_cancel = st.columns(3)
         save_clicked = btn_save.form_submit_button(
-            "💾 Save paint specification rates", type="primary", width="stretch"
+            "⏳ Saving…" if _mr_action == "save" else "💾 Save paint specification rates",
+            type="primary", width="stretch", disabled=_mr_busy,
         )
         reset_clicked = btn_reset.form_submit_button(
-            "🔄 Reset paint rates to factory defaults", width="stretch"
+            "⏳ Resetting…" if _mr_action == "reset" else "🔄 Reset paint rates to factory defaults",
+            width="stretch", disabled=_mr_busy,
         )
         cancel_clicked = btn_cancel.form_submit_button(
-            "❌ Cancel / Discard paint rate changes", width="stretch"
+            "⏳ Discarding…" if _mr_action == "cancel" else "❌ Cancel / Discard paint rate changes",
+            width="stretch", disabled=_mr_busy,
         )
 
-    if save_clicked:
-        sorted_df = _prepare_master_rates_df(edited_df)
-        _mr, _mu, _mn = _df_to_rate_dicts(sorted_df)
-        with st.spinner("Saving paint specification rates…"):
+    if _mr_action == "save":
+        _pending = st.session_state.pop("_mr_pending_df", None)
+        if _pending is not None:
+            sorted_df = _prepare_master_rates_df(_pending)
+            _mr, _mu, _mn = _df_to_rate_dicts(sorted_df)
+            with st.spinner("Saving paint specification rates…"):
+                try:
+                    db_sheets.save_custom_rates(_mr, _mu, _mn)
+                    _clear_rates_cache()
+                    st.session_state.master_rates_df = sorted_df
+                    st.session_state.item_rates_df = sorted_df.copy()
+                    st.session_state.ITEM_RATES = _mr
+                    st.session_state.ITEM_UNITS = _mu
+                    st.session_state.DEFAULT_JOB_NOTES = _mn
+                    st.session_state.rates_version += 1
+                    _clear_streamlit_widget_key(_MASTER_RATES_EDITOR_KEY)
+                    st.session_state.pop("_mr_action", None)
+                    st.success("✅ Paint specification rates saved permanently!")
+                    st.rerun()
+                except Exception as _mr_err:
+                    st.session_state.pop("_mr_action", None)
+                    st.error(f"Could not save rates — {_sheets_error_msg(_mr_err)}")
+    elif _mr_action == "reset":
+        _mr, _mu, _mn = _df_to_rate_dicts(pd.DataFrame(DEFAULT_MASTER_RATES))
+        with st.spinner("Resetting paint rates to factory defaults…"):
             try:
                 db_sheets.save_custom_rates(_mr, _mu, _mn)
                 _clear_rates_cache()
-                st.session_state.master_rates_df = sorted_df
-                st.session_state.item_rates_df = sorted_df.copy()
-                st.session_state.ITEM_RATES = _mr
-                st.session_state.ITEM_UNITS = _mu
-                st.session_state.DEFAULT_JOB_NOTES = _mn
+                st.session_state.master_rates_df = _prepare_master_rates_df(pd.DataFrame(DEFAULT_MASTER_RATES))
+                st.session_state.item_rates_df = st.session_state.master_rates_df.copy()
+                _update_session_rates_from_df(st.session_state.master_rates_df)
                 st.session_state.rates_version += 1
                 _clear_streamlit_widget_key(_MASTER_RATES_EDITOR_KEY)
-                st.success("✅ Paint specification rates saved permanently!")
+                st.session_state.pop("_mr_action", None)
+                st.success("Factory default paint rates restored.")
                 st.rerun()
             except Exception as _mr_err:
-                st.error(f"Could not save rates — {_sheets_error_msg(_mr_err)}")
-
-    if reset_clicked:
-        _mr, _mu, _mn = _df_to_rate_dicts(pd.DataFrame(DEFAULT_MASTER_RATES))
-        try:
-            db_sheets.save_custom_rates(_mr, _mu, _mn)
-            _clear_rates_cache()
-            st.session_state.master_rates_df = _prepare_master_rates_df(pd.DataFrame(DEFAULT_MASTER_RATES))
+                st.session_state.pop("_mr_action", None)
+                st.error(f"Could not reset rates — {_sheets_error_msg(_mr_err)}")
+    elif _mr_action == "cancel":
+        with st.spinner("Discarding changes…"):
+            st.session_state.master_rates_df = _prepare_master_rates_df(_load_master_rates_dataframe())
             st.session_state.item_rates_df = st.session_state.master_rates_df.copy()
             _update_session_rates_from_df(st.session_state.master_rates_df)
             st.session_state.rates_version += 1
             _clear_streamlit_widget_key(_MASTER_RATES_EDITOR_KEY)
-            st.success("Factory default paint rates restored.")
-            st.rerun()
-        except Exception as _mr_err:
-            st.error(f"Could not reset rates — {_sheets_error_msg(_mr_err)}")
-
-    if cancel_clicked:
-        st.session_state.master_rates_df = _prepare_master_rates_df(_load_master_rates_dataframe())
-        st.session_state.item_rates_df = st.session_state.master_rates_df.copy()
-        _update_session_rates_from_df(st.session_state.master_rates_df)
-        st.session_state.rates_version += 1
-        _clear_streamlit_widget_key(_MASTER_RATES_EDITOR_KEY)
+        st.session_state.pop("_mr_action", None)
+        st.rerun()
+    elif save_clicked:
+        st.session_state["_mr_pending_df"] = edited_df.copy()
+        st.session_state["_mr_action"] = "save"
+        st.rerun()
+    elif reset_clicked:
+        st.session_state["_mr_action"] = "reset"
+        st.rerun()
+    elif cancel_clicked:
+        st.session_state["_mr_action"] = "cancel"
         st.rerun()
 
     st.divider()
     st.subheader("Additional Rates")
+
+    _ar_action = st.session_state.get("_ar_action")  # "save" | "reset" | "cancel" | None
+    _ar_busy = _ar_action is not None
 
     with st.form("master_additional_rates_form", clear_on_submit=False, border=False):
         edited_additional_df = st.data_editor(
@@ -1490,56 +1518,75 @@ with tab_master:
             hide_index=True,
             key=_MASTER_ADDITIONAL_RATES_EDITOR_KEY,
             column_config=_master_additional_rates_column_config(),
+            disabled=_ar_busy,
         )
         add_btn_save, add_btn_reset, add_btn_cancel = st.columns(3)
         add_save_clicked = add_btn_save.form_submit_button(
-            "💾 Save additional rates", type="primary", width="stretch"
+            "⏳ Saving…" if _ar_action == "save" else "💾 Save additional rates",
+            type="primary", width="stretch", disabled=_ar_busy,
         )
         add_reset_clicked = add_btn_reset.form_submit_button(
-            "🔄 Reset additional rates to factory defaults", width="stretch"
+            "⏳ Resetting…" if _ar_action == "reset" else "🔄 Reset additional rates to factory defaults",
+            width="stretch", disabled=_ar_busy,
         )
         add_cancel_clicked = add_btn_cancel.form_submit_button(
-            "❌ Cancel / Discard additional rate changes", width="stretch"
+            "⏳ Discarding…" if _ar_action == "cancel" else "❌ Cancel / Discard additional rate changes",
+            width="stretch", disabled=_ar_busy,
         )
 
-    if add_save_clicked:
-        sorted_additional_df = _prepare_master_additional_rates_df(edited_additional_df)
-        with st.spinner("Saving additional rates…"):
+    if _ar_action == "save":
+        _ar_pending = st.session_state.pop("_ar_pending_df", None)
+        if _ar_pending is not None:
+            sorted_additional_df = _prepare_master_additional_rates_df(_ar_pending)
+            with st.spinner("Saving additional rates…"):
+                try:
+                    db_sheets.save_custom_additional_rates(_additional_rates_df_to_db_rows(sorted_additional_df))
+                    _clear_rates_cache()
+                    st.session_state.master_additional_rates_df = sorted_additional_df
+                    _update_session_additional_rates_from_df(sorted_additional_df)
+                    st.session_state.rates_version += 1
+                    _clear_streamlit_widget_key(_MASTER_ADDITIONAL_RATES_EDITOR_KEY)
+                    st.session_state.pop("_ar_action", None)
+                    st.success("✅ Additional rates saved permanently!")
+                    st.rerun()
+                except Exception as _ar_err:
+                    st.session_state.pop("_ar_action", None)
+                    st.error(f"Could not save additional rates — {_sheets_error_msg(_ar_err)}")
+    elif _ar_action == "reset":
+        _ar_default = _prepare_master_additional_rates_df(pd.DataFrame(DEFAULT_MASTER_ADDITIONAL_RATES))
+        with st.spinner("Resetting additional rates to factory defaults…"):
             try:
-                db_sheets.save_custom_additional_rates(_additional_rates_df_to_db_rows(sorted_additional_df))
+                db_sheets.save_custom_additional_rates(_additional_rates_df_to_db_rows(_ar_default))
                 _clear_rates_cache()
-                st.session_state.master_additional_rates_df = sorted_additional_df
-                _update_session_additional_rates_from_df(sorted_additional_df)
+                st.session_state.master_additional_rates_df = _ar_default
+                _update_session_additional_rates_from_df(_ar_default)
                 st.session_state.rates_version += 1
                 _clear_streamlit_widget_key(_MASTER_ADDITIONAL_RATES_EDITOR_KEY)
-                st.success("✅ Additional rates saved permanently!")
+                st.session_state.pop("_ar_action", None)
+                st.success("Factory default additional rates restored.")
                 st.rerun()
             except Exception as _ar_err:
-                st.error(f"Could not save additional rates — {_sheets_error_msg(_ar_err)}")
-
-    if add_reset_clicked:
-        default_additional_df = _prepare_master_additional_rates_df(
-            pd.DataFrame(DEFAULT_MASTER_ADDITIONAL_RATES)
-        )
-        try:
-            db_sheets.save_custom_additional_rates(_additional_rates_df_to_db_rows(default_additional_df))
-            _clear_rates_cache()
-            st.session_state.master_additional_rates_df = default_additional_df
-            _update_session_additional_rates_from_df(default_additional_df)
+                st.session_state.pop("_ar_action", None)
+                st.error(f"Could not reset additional rates — {_sheets_error_msg(_ar_err)}")
+    elif _ar_action == "cancel":
+        with st.spinner("Discarding changes…"):
+            st.session_state.master_additional_rates_df = _prepare_master_additional_rates_df(
+                _load_master_additional_rates_dataframe()
+            )
+            _update_session_additional_rates_from_df(st.session_state.master_additional_rates_df)
             st.session_state.rates_version += 1
             _clear_streamlit_widget_key(_MASTER_ADDITIONAL_RATES_EDITOR_KEY)
-            st.success("Factory default additional rates restored.")
-            st.rerun()
-        except Exception as _ar_err:
-            st.error(f"Could not reset additional rates — {_sheets_error_msg(_ar_err)}")
-
-    if add_cancel_clicked:
-        st.session_state.master_additional_rates_df = _prepare_master_additional_rates_df(
-            _load_master_additional_rates_dataframe()
-        )
-        _update_session_additional_rates_from_df(st.session_state.master_additional_rates_df)
-        st.session_state.rates_version += 1
-        _clear_streamlit_widget_key(_MASTER_ADDITIONAL_RATES_EDITOR_KEY)
+        st.session_state.pop("_ar_action", None)
+        st.rerun()
+    elif add_save_clicked:
+        st.session_state["_ar_pending_df"] = edited_additional_df.copy()
+        st.session_state["_ar_action"] = "save"
+        st.rerun()
+    elif add_reset_clicked:
+        st.session_state["_ar_action"] = "reset"
+        st.rerun()
+    elif add_cancel_clicked:
+        st.session_state["_ar_action"] = "cancel"
         st.rerun()
 
 # ====================== TAB 1: QUOTE BREAKDOWN ======================
@@ -1972,7 +2019,18 @@ Pro Paint Teams"""
     # Save to Database
     st.divider()
     if DB_READY:
-        if st.button("💾 Save Quote & Client to Cloud Database", type="primary", width="stretch", key="save_quote_btn"):
+        _saving_quote = st.session_state.get("_saving_quote", False)
+
+        def _on_save_quote_click():
+            st.session_state["_saving_quote"] = True
+
+        st.button(
+            "⏳ Saving to cloud…" if _saving_quote else "💾 Save Quote & Client to Cloud Database",
+            type="primary", width="stretch", key="save_quote_btn",
+            disabled=_saving_quote,
+            on_click=_on_save_quote_click,
+        )
+        if _saving_quote:
             with st.spinner("Saving quote to cloud…"):
                 try:
                     db_sheets.save_client(client, client_phone, client_email, client_address)
@@ -1980,8 +2038,10 @@ Pro Paint Teams"""
                                        area_manager=area_manager, team_leader="", start_date=quote_date,
                                        total_labour=total_labour, man_days_available=0)
                     _clear_jobs_cache()
+                    st.session_state["_saving_quote"] = False
                     st.success(f"✅ Quote **{job_no}** saved!")
                 except Exception as e:
+                    st.session_state["_saving_quote"] = False
                     st.error(f"Save failed — {_sheets_error_msg(e)}")
 
     # Data bridge for other tabs — scalar writes are cheap, always update
