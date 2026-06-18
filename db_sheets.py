@@ -17,6 +17,32 @@ from gspread.exceptions import APIError
 
 T = TypeVar("T")
 
+
+# ---------------------------------------------------------------------------
+# Custom exception hierarchy
+# ---------------------------------------------------------------------------
+
+class SheetsUnavailableError(RuntimeError):
+    """Google Sheets API is temporarily unreachable (network or service outage)."""
+
+
+class SheetsAuthError(RuntimeError):
+    """Google service account authentication failed."""
+
+
+class SheetsConfigError(RuntimeError):
+    """Google Sheets credentials or spreadsheet ID are not configured."""
+
+
+# Import requests exceptions for network-level error detection.
+# gspread uses requests internally; these can bubble up unwrapped.
+try:
+    from requests.exceptions import ConnectionError as _ReqConnectionError
+    from requests.exceptions import Timeout as _ReqTimeout
+    _NETWORK_ERRORS = (_ReqConnectionError, _ReqTimeout)
+except ImportError:  # pragma: no cover
+    _NETWORK_ERRORS = (OSError,)
+
 _sp_cache = None
 _worksheets_verified = False
 
@@ -117,12 +143,21 @@ def _verify_credentials(creds: Credentials) -> None:
         creds.refresh(Request())
     except RefreshError as exc:
         email = getattr(creds, "service_account_email", "unknown")
-        raise RuntimeError(
-            f"Google authentication failed for service account {email}. "
-            "Google reported that this account does not exist or its key was revoked. "
+        raise SheetsAuthError(
+            f"Google authentication failed for service account '{email}'. "
+            "The account may not exist or its key was revoked. "
             "In Google Cloud Console → IAM & Admin → Service Accounts, confirm the account "
             "still exists, create a new JSON key if needed, then update credentials.json "
             "and Streamlit secrets with the new file."
+        ) from exc
+    except _NETWORK_ERRORS as exc:
+        raise SheetsUnavailableError(
+            "Could not reach Google's authentication servers. "
+            "Check your internet connection."
+        ) from exc
+    except (OSError, TimeoutError) as exc:
+        raise SheetsUnavailableError(
+            "Network error while verifying Google credentials."
         ) from exc
 
 
@@ -166,16 +201,50 @@ def _reset_connection_cache() -> None:
 
 
 def _retry_on_quota(func: Callable[..., T], *args, **kwargs) -> T:
-    """Retry Google Sheets calls when the per-minute read/write quota is hit."""
+    """Retry on quota (429), server errors (5xx), and transient network failures."""
+    last_exc: Exception | None = None
     for attempt in range(5):
         try:
             return func(*args, **kwargs)
         except APIError as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
+            last_exc = exc
             if status == 429 and attempt < 4:
+                # Quota exceeded — exponential back-off, up to 45 s
                 time.sleep(min(2**attempt * 3, 45))
                 continue
+            if status is not None and status >= 500 and attempt < 4:
+                # Server-side error — retry with shorter back-off
+                time.sleep(min(2**attempt * 2, 30))
+                continue
+            if status is not None and status >= 500:
+                raise SheetsUnavailableError(
+                    f"Google Sheets returned HTTP {status}. "
+                    "The service appears to be temporarily unavailable — "
+                    "please try again in a few minutes."
+                ) from exc
             raise
+        except _NETWORK_ERRORS as exc:
+            last_exc = exc
+            if attempt < 4:
+                time.sleep(min(2**attempt * 2, 30))
+                continue
+            raise SheetsUnavailableError(
+                "Could not reach Google Sheets — network or service unavailable. "
+                "Check your internet connection and try again."
+            ) from exc
+        except (OSError, TimeoutError) as exc:
+            last_exc = exc
+            if attempt < 4:
+                time.sleep(min(2**attempt * 2, 30))
+                continue
+            raise SheetsUnavailableError(
+                "Lost connection to Google Sheets. "
+                "Check your internet connection and try again."
+            ) from exc
+    raise SheetsUnavailableError(
+        "Google Sheets is unavailable after repeated attempts. Please try again later."
+    ) from last_exc
 
 
 def connect():
@@ -186,17 +255,38 @@ def connect():
 
     creds = _load_credentials()
     if creds is None:
-        raise RuntimeError(
+        raise SheetsConfigError(
             "Google credentials not found. Add credentials.json or Streamlit secrets."
         )
     _verify_credentials(creds)
     sheet_id = _get_spreadsheet_id()
     if not sheet_id:
-        raise RuntimeError(
+        raise SheetsConfigError(
             "Spreadsheet ID not configured. Run setup_sheets.py or set spreadsheet_id in secrets."
         )
-    gc = gspread.authorize(creds)
-    sp = _retry_on_quota(gc.open_by_key, sheet_id)
+    try:
+        gc = gspread.authorize(creds)
+        sp = _retry_on_quota(gc.open_by_key, sheet_id)
+    except (SheetsUnavailableError, SheetsAuthError, SheetsConfigError):
+        _reset_connection_cache()
+        raise
+    except APIError as exc:
+        _reset_connection_cache()
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status == 404:
+            raise SheetsConfigError(
+                f"Spreadsheet not found (ID: {sheet_id}). "
+                "Check the spreadsheet ID and ensure the service account has been granted access."
+            ) from exc
+        raise SheetsUnavailableError(
+            f"Google Sheets returned HTTP {status} while opening the spreadsheet. "
+            "The service may be temporarily unavailable."
+        ) from exc
+    except Exception as exc:
+        _reset_connection_cache()
+        raise SheetsUnavailableError(
+            f"Could not connect to Google Sheets: {exc}"
+        ) from exc
     _retry_on_quota(_ensure_worksheets, sp)
     _worksheets_verified = True
     _sp_cache = sp
@@ -298,10 +388,34 @@ def _replace_sheet(name: str, rows: list[dict]) -> None:
     _retry_on_quota(ws.update, data, "A1")
 
 
+def health_check() -> tuple[bool, str]:
+    """Test live connectivity to Google Sheets. Returns (ok, message).
+
+    Resets the connection cache on failure so the next real call
+    attempts a fresh connection.
+    """
+    if not is_configured():
+        return False, "Google Sheets is not configured."
+    try:
+        sp = connect()
+        _ = sp.title  # lightweight attribute access — no extra API call
+        return True, "Connected"
+    except SheetsUnavailableError as exc:
+        _reset_connection_cache()
+        return False, str(exc)
+    except SheetsAuthError as exc:
+        return False, str(exc)
+    except SheetsConfigError as exc:
+        return False, str(exc)
+    except Exception as exc:
+        _reset_connection_cache()
+        return False, f"Unexpected error: {exc}"
+
+
 # ====================== CLIENTS ======================
 def save_client(client, phone="", email="", address=""):
     if not is_configured():
-        raise RuntimeError("Google Sheets is not configured")
+        raise SheetsConfigError("Google Sheets is not configured")
     if not str(client or "").strip():
         raise ValueError("Client name is required")
     _upsert_by_key(
@@ -334,7 +448,7 @@ def save_job(
     man_days_available,
 ):
     if not is_configured():
-        raise RuntimeError("Google Sheets is not configured")
+        raise SheetsConfigError("Google Sheets is not configured")
     _upsert_by_key(
         "Jobs",
         "job_no",
@@ -362,7 +476,7 @@ def update_job_fields(job_no: str, fields: dict) -> bool:
     Returns True if the job was found and updated.
     """
     if not is_configured():
-        raise RuntimeError("Google Sheets is not configured")
+        raise SheetsConfigError("Google Sheets is not configured")
     return _update_row_fields("Jobs", "job_no", str(job_no), fields)
 
 
@@ -374,7 +488,7 @@ def update_client_fields(original_name: str, fields: dict) -> bool:
     Never creates a new row.  Returns True if the client was found.
     """
     if not is_configured():
-        raise RuntimeError("Google Sheets is not configured")
+        raise SheetsConfigError("Google Sheets is not configured")
     return _update_row_fields("Clients", "client", original_name, fields)
 
 
@@ -419,7 +533,7 @@ def get_job_history():
 # ====================== CUSTOM RATES ======================
 def save_custom_rates(item_rates_dict, item_units_dict, default_job_notes_dict):
     if not is_configured():
-        raise RuntimeError("Google Sheets is not configured")
+        raise SheetsConfigError("Google Sheets is not configured")
     date_updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     rows = []
     for sort_order, (item, rates) in enumerate(item_rates_dict.items(), start=1):
@@ -470,7 +584,7 @@ def load_custom_rates():
 # ====================== ADDITIONAL RATES ======================
 def save_custom_additional_rates(rows):
     if not is_configured():
-        raise RuntimeError("Google Sheets is not configured")
+        raise SheetsConfigError("Google Sheets is not configured")
     date_updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     payload = []
     for row in rows:

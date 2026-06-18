@@ -338,7 +338,7 @@ if _standalone_quote:
                                 st.rerun()
                             except Exception as _sa_err:
                                 st.session_state["_sa_saving"] = False
-                                st.error(f"Save failed: {_sa_err}")
+                                st.error(f"Save failed — {_sheets_error_msg(_sa_err)}")
 
                     else:
                         # ---- Phase 1: editable form ----
@@ -413,15 +413,70 @@ if _standalone_quote:
 st.title("Pro Paint Teams Job/Site Worksheet App")
 st.caption("Version 2.8 – Google Sheets + Linux-compatible PDFs")
 
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _check_sheets_connectivity() -> tuple[bool, str]:
+    """Probe Google Sheets connectivity. Result cached for 5 minutes."""
+    return db_sheets.health_check()
+
+
+def _sheets_error_msg(exc: Exception) -> str:
+    """Return a plain-language error message for any Google Sheets exception."""
+    if isinstance(exc, db_sheets.SheetsUnavailableError):
+        return (
+            "Google Sheets appears to be temporarily unavailable. "
+            "Your session data is preserved — please try again in a few minutes."
+        )
+    if isinstance(exc, db_sheets.SheetsAuthError):
+        return (
+            "Google authentication failed. "
+            "The service account key may have expired — contact your administrator."
+        )
+    if isinstance(exc, db_sheets.SheetsConfigError):
+        return (
+            "Google Sheets is not configured. "
+            "Run setup_sheets.py locally or add the required Streamlit secrets."
+        )
+    return str(exc)
+
+
 try:
     DB_READY = db_sheets.is_configured()
 except Exception:
     DB_READY = False
+
+# Track live connectivity separately from configuration.
+# SHEETS_OK=False shows a persistent banner with a Retry button.
+SHEETS_OK = True
+SHEETS_ERROR_MSG = ""
+
+if DB_READY:
+    _conn_ok, _conn_msg = _check_sheets_connectivity()
+    if not _conn_ok:
+        SHEETS_OK = False
+        SHEETS_ERROR_MSG = _conn_msg
+
 if not DB_READY:
     st.warning(
-        "Google Sheets not configured — cloud save disabled. "
-        "Run setup_sheets.py locally or add secrets on Streamlit Cloud."
+        "⚠️ **Google Sheets not configured** — cloud save is disabled. "
+        "Run `setup_sheets.py` locally or add the required secrets on Streamlit Cloud."
     )
+elif not SHEETS_OK:
+    _banner_col, _retry_col = st.columns([6, 1])
+    with _banner_col:
+        st.error(
+            "🔴 **Google Sheets is currently unavailable.** "
+            "Saves and data loads are disabled until the connection is restored. "
+            "Your in-session quote data is unaffected. "
+            f"_{SHEETS_ERROR_MSG}_"
+        )
+    with _retry_col:
+        st.write("")  # vertical alignment spacer
+        if st.button("🔄 Retry", key="sheets_retry_banner", type="secondary",
+                     use_container_width=True):
+            _check_sheets_connectivity.clear()
+            db_sheets._reset_connection_cache()
+            st.rerun()
 
 # ====================== HELPER FUNCTIONS ======================
 
@@ -657,7 +712,10 @@ def _apply_tab2_editor_edits(base_df, edited_show, area_only, job_notes_col):
 
 def _load_master_rates_dataframe():
     """Load master rates from DB, or built-in defaults when nothing is saved yet."""
-    loaded = _cached_custom_rates()
+    try:
+        loaded = _cached_custom_rates()
+    except Exception:
+        return pd.DataFrame(DEFAULT_MASTER_RATES)
     if len(loaded) == 4:
         custom_rates, custom_units, custom_notes, sort_orders = loaded
     else:
@@ -861,7 +919,10 @@ def _update_session_additional_rates_from_df(df=None):
 
 
 def _load_master_additional_rates_dataframe():
-    loaded = _cached_additional_rates()
+    try:
+        loaded = _cached_additional_rates()
+    except Exception:
+        return pd.DataFrame(DEFAULT_MASTER_ADDITIONAL_RATES)
     if loaded:
         data = [
             {
@@ -1357,29 +1418,35 @@ with tab_master:
     if save_clicked:
         sorted_df = _prepare_master_rates_df(edited_df)
         _mr, _mu, _mn = _df_to_rate_dicts(sorted_df)
-        db_sheets.save_custom_rates(_mr, _mu, _mn)
-        _clear_cloud_cache()
-        st.session_state.master_rates_df = sorted_df
-        st.session_state.item_rates_df = sorted_df.copy()
-        st.session_state.ITEM_RATES = _mr
-        st.session_state.ITEM_UNITS = _mu
-        st.session_state.DEFAULT_JOB_NOTES = _mn
-        st.session_state.rates_version += 1
-        _clear_streamlit_widget_key(_MASTER_RATES_EDITOR_KEY)
-        st.success("✅ Paint specification rates saved permanently!")
-        st.rerun()
+        try:
+            db_sheets.save_custom_rates(_mr, _mu, _mn)
+            _clear_cloud_cache()
+            st.session_state.master_rates_df = sorted_df
+            st.session_state.item_rates_df = sorted_df.copy()
+            st.session_state.ITEM_RATES = _mr
+            st.session_state.ITEM_UNITS = _mu
+            st.session_state.DEFAULT_JOB_NOTES = _mn
+            st.session_state.rates_version += 1
+            _clear_streamlit_widget_key(_MASTER_RATES_EDITOR_KEY)
+            st.success("✅ Paint specification rates saved permanently!")
+            st.rerun()
+        except Exception as _mr_err:
+            st.error(f"Could not save rates — {_sheets_error_msg(_mr_err)}")
 
     if reset_clicked:
         _mr, _mu, _mn = _df_to_rate_dicts(pd.DataFrame(DEFAULT_MASTER_RATES))
-        db_sheets.save_custom_rates(_mr, _mu, _mn)
-        _clear_cloud_cache()
-        st.session_state.master_rates_df = _prepare_master_rates_df(pd.DataFrame(DEFAULT_MASTER_RATES))
-        st.session_state.item_rates_df = st.session_state.master_rates_df.copy()
-        _update_session_rates_from_df(st.session_state.master_rates_df)
-        st.session_state.rates_version += 1
-        _clear_streamlit_widget_key(_MASTER_RATES_EDITOR_KEY)
-        st.success("Factory default paint rates restored.")
-        st.rerun()
+        try:
+            db_sheets.save_custom_rates(_mr, _mu, _mn)
+            _clear_cloud_cache()
+            st.session_state.master_rates_df = _prepare_master_rates_df(pd.DataFrame(DEFAULT_MASTER_RATES))
+            st.session_state.item_rates_df = st.session_state.master_rates_df.copy()
+            _update_session_rates_from_df(st.session_state.master_rates_df)
+            st.session_state.rates_version += 1
+            _clear_streamlit_widget_key(_MASTER_RATES_EDITOR_KEY)
+            st.success("Factory default paint rates restored.")
+            st.rerun()
+        except Exception as _mr_err:
+            st.error(f"Could not reset rates — {_sheets_error_msg(_mr_err)}")
 
     if cancel_clicked:
         st.session_state.master_rates_df = _prepare_master_rates_df(_load_master_rates_dataframe())
@@ -1414,27 +1481,33 @@ with tab_master:
 
     if add_save_clicked:
         sorted_additional_df = _prepare_master_additional_rates_df(edited_additional_df)
-        db_sheets.save_custom_additional_rates(_additional_rates_df_to_db_rows(sorted_additional_df))
-        _clear_cloud_cache()
-        st.session_state.master_additional_rates_df = sorted_additional_df
-        _update_session_additional_rates_from_df(sorted_additional_df)
-        st.session_state.rates_version += 1
-        _clear_streamlit_widget_key(_MASTER_ADDITIONAL_RATES_EDITOR_KEY)
-        st.success("✅ Additional rates saved permanently!")
-        st.rerun()
+        try:
+            db_sheets.save_custom_additional_rates(_additional_rates_df_to_db_rows(sorted_additional_df))
+            _clear_cloud_cache()
+            st.session_state.master_additional_rates_df = sorted_additional_df
+            _update_session_additional_rates_from_df(sorted_additional_df)
+            st.session_state.rates_version += 1
+            _clear_streamlit_widget_key(_MASTER_ADDITIONAL_RATES_EDITOR_KEY)
+            st.success("✅ Additional rates saved permanently!")
+            st.rerun()
+        except Exception as _ar_err:
+            st.error(f"Could not save additional rates — {_sheets_error_msg(_ar_err)}")
 
     if add_reset_clicked:
         default_additional_df = _prepare_master_additional_rates_df(
             pd.DataFrame(DEFAULT_MASTER_ADDITIONAL_RATES)
         )
-        db_sheets.save_custom_additional_rates(_additional_rates_df_to_db_rows(default_additional_df))
-        _clear_cloud_cache()
-        st.session_state.master_additional_rates_df = default_additional_df
-        _update_session_additional_rates_from_df(default_additional_df)
-        st.session_state.rates_version += 1
-        _clear_streamlit_widget_key(_MASTER_ADDITIONAL_RATES_EDITOR_KEY)
-        st.success("Factory default additional rates restored.")
-        st.rerun()
+        try:
+            db_sheets.save_custom_additional_rates(_additional_rates_df_to_db_rows(default_additional_df))
+            _clear_cloud_cache()
+            st.session_state.master_additional_rates_df = default_additional_df
+            _update_session_additional_rates_from_df(default_additional_df)
+            st.session_state.rates_version += 1
+            _clear_streamlit_widget_key(_MASTER_ADDITIONAL_RATES_EDITOR_KEY)
+            st.success("Factory default additional rates restored.")
+            st.rerun()
+        except Exception as _ar_err:
+            st.error(f"Could not reset additional rates — {_sheets_error_msg(_ar_err)}")
 
     if add_cancel_clicked:
         st.session_state.master_additional_rates_df = _prepare_master_additional_rates_df(
@@ -1884,7 +1957,7 @@ Pro Paint Teams"""
                 _clear_cloud_cache()
                 st.success(f"✅ Quote **{job_no}** saved!")
             except Exception as e:
-                st.error(f"Save error: {e}")
+                st.error(f"Save failed — {_sheets_error_msg(e)}")
 
     # Data bridge for other tabs
     st.session_state.total_material = total_material
@@ -2436,8 +2509,19 @@ with tab6:
     else:
         try:
             quotes_df = _cached_job_history()
-        except Exception as e:
-            st.error(f"Could not load saved quotes: {e}")
+        except Exception as _t6_err:
+            _t6_err_col, _t6_retry_col = st.columns([5, 1])
+            with _t6_err_col:
+                st.error(
+                    f"Could not load saved quotes — {_sheets_error_msg(_t6_err)}"
+                )
+            with _t6_retry_col:
+                if st.button("🔄 Retry", key="t6_load_retry_btn", type="secondary",
+                             use_container_width=True):
+                    _cached_job_history.clear()
+                    _check_sheets_connectivity.clear()
+                    db_sheets._reset_connection_cache()
+                    st.rerun()
             quotes_df = pd.DataFrame()
 
         if quotes_df.empty:
