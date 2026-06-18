@@ -13,7 +13,7 @@ import pandas as pd
 from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.service_account import Credentials
-from gspread.exceptions import APIError
+from gspread.exceptions import APIError, CellNotFound
 
 T = TypeVar("T")
 
@@ -45,6 +45,7 @@ except ImportError:  # pragma: no cover
 
 _sp_cache = None
 _worksheets_verified = False
+_is_configured_cache: bool | None = None
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -179,7 +180,10 @@ def _get_spreadsheet_id() -> str | None:
 
 
 def is_configured() -> bool:
-    return bool(_load_credentials() and _get_spreadsheet_id())
+    global _is_configured_cache
+    if _is_configured_cache is None:
+        _is_configured_cache = bool(_load_credentials() and _get_spreadsheet_id())
+    return _is_configured_cache
 
 
 def get_service_account_email() -> str:
@@ -195,9 +199,10 @@ def save_spreadsheet_id(sheet_id: str) -> None:
 
 
 def _reset_connection_cache() -> None:
-    global _sp_cache, _worksheets_verified
+    global _sp_cache, _worksheets_verified, _is_configured_cache
     _sp_cache = None
     _worksheets_verified = False
+    _is_configured_cache = None
 
 
 def _retry_on_quota(func: Callable[..., T], *args, **kwargs) -> T:
@@ -319,24 +324,29 @@ def _read_dataframe(name: str) -> pd.DataFrame:
 def _upsert_by_key(name: str, key_field: str, key_value: str, row: dict) -> None:
     ws = _worksheet(name)
     headers = SHEET_HEADERS[name]
-    values = _retry_on_quota(ws.get_all_values)
-    if not values:
-        _retry_on_quota(ws.update, [headers], "A1")
-        values = [headers]
-
-    header_row = values[0]
-    try:
-        key_idx = header_row.index(key_field)
-    except ValueError:
-        key_idx = headers.index(key_field)
-
     row_values = [str(row.get(h, "") or "") for h in headers]
-    key_value = str(key_value).strip()
+    key_value_str = str(key_value).strip()
 
-    for row_num, existing in enumerate(values[1:], start=2):
-        if len(existing) > key_idx and str(existing[key_idx]).strip() == key_value:
-            _retry_on_quota(ws.update, [row_values], f"A{row_num}")
+    try:
+        key_col = headers.index(key_field) + 1  # gspread uses 1-based columns
+    except ValueError:
+        key_col = 1
+
+    # Ensure the header row exists (cheap single-cell check)
+    try:
+        if not _retry_on_quota(ws.acell, "A1").value:
+            _retry_on_quota(ws.update, [headers], "A1")
+    except Exception:
+        _retry_on_quota(ws.update, [headers], "A1")
+
+    # Use find() to locate the existing row — far cheaper than get_all_values()
+    try:
+        cell = _retry_on_quota(ws.find, key_value_str, in_column=key_col)
+        if cell and cell.row > 1:
+            _retry_on_quota(ws.update, [row_values], f"A{cell.row}")
             return
+    except CellNotFound:
+        pass
 
     _retry_on_quota(ws.append_row, row_values, value_input_option="USER_ENTERED")
 
@@ -349,33 +359,33 @@ def _update_row_fields(name: str, key_field: str, key_value: str, fields: dict) 
     """
     ws = _worksheet(name)
     headers = SHEET_HEADERS[name]
-    values = _retry_on_quota(ws.get_all_values)
-    if not values:
+    key_value_str = str(key_value).strip()
+
+    try:
+        key_col = headers.index(key_field) + 1
+    except ValueError:
         return False
 
-    header_row = values[0]
+    # Use find() to locate the row — avoids fetching the entire sheet
     try:
-        key_idx = header_row.index(key_field)
-    except ValueError:
-        try:
-            key_idx = headers.index(key_field)
-        except ValueError:
+        cell = _retry_on_quota(ws.find, key_value_str, in_column=key_col)
+        if not cell or cell.row <= 1:
             return False
+    except CellNotFound:
+        return False
 
-    key_value = str(key_value).strip()
-
-    for row_num, existing in enumerate(values[1:], start=2):
-        if len(existing) > key_idx and str(existing[key_idx]).strip() == key_value:
-            # Build updated row: start from existing values, overlay changed fields
-            existing_padded = list(existing) + [""] * max(0, len(headers) - len(existing))
-            updated = list(existing_padded[:len(headers)])
-            for field, value in fields.items():
-                if field in headers:
-                    updated[headers.index(field)] = str(value) if value is not None else ""
-            _retry_on_quota(ws.update, [updated], f"A{row_num}")
-            return True
-
-    return False
+    # Fetch only the single target row to read existing values
+    end_col_letter = chr(64 + len(headers)) if len(headers) <= 26 else "Z"
+    row_range = f"A{cell.row}:{end_col_letter}{cell.row}"
+    existing_data = _retry_on_quota(ws.get, row_range)
+    existing = list(existing_data[0]) if existing_data else []
+    existing_padded = existing + [""] * max(0, len(headers) - len(existing))
+    updated = list(existing_padded[:len(headers)])
+    for field, value in fields.items():
+        if field in headers:
+            updated[headers.index(field)] = str(value) if value is not None else ""
+    _retry_on_quota(ws.update, [updated], f"A{cell.row}")
+    return True
 
 
 def _replace_sheet(name: str, rows: list[dict]) -> None:

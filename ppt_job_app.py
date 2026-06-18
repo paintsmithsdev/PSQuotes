@@ -331,7 +331,7 @@ if _standalone_quote:
                                     },
                                 )
 
-                                st.cache_data.clear()
+                                _clear_cloud_cache()
                                 st.session_state["_sa_saving"] = False
                                 st.session_state["_sa_editing"] = False
                                 st.session_state["_standalone_quote"] = _sa_job_no
@@ -492,7 +492,15 @@ def _cached_attendance(job_no=None): return db_sheets.get_attendance(job_no)
 @st.cache_data(ttl=120, show_spinner=False)
 def _cached_bonus_log(): return db_sheets.get_bonus_log()
 @st.cache_data(ttl=120, show_spinner=False)
-def _cached_job_history(): return db_sheets.get_job_history()
+def _cached_job_history():
+    jobs = _cached_jobs()
+    clients = _cached_clients()
+    if jobs.empty:
+        return jobs
+    if clients.empty or "client" not in clients.columns:
+        return jobs
+    return jobs.merge(clients, on="client", how="left", suffixes=("", "_client"))
+
 @st.cache_data(ttl=120, show_spinner=False)
 def _cached_custom_rates(): return db_sheets.load_custom_rates()
 @st.cache_data(ttl=120, show_spinner=False)
@@ -505,6 +513,20 @@ def _clear_cloud_cache():
     _cached_attendance.clear()
     _cached_bonus_log.clear()
     _cached_job_history.clear()
+    _cached_custom_rates.clear()
+    _cached_additional_rates.clear()
+
+def _clear_jobs_cache():
+    """Clear only job/client caches — leave rates untouched."""
+    _cached_clients.clear()
+    _cached_jobs.clear()
+    _cached_quote_areas.clear()
+    _cached_attendance.clear()
+    _cached_bonus_log.clear()
+    _cached_job_history.clear()
+
+def _clear_rates_cache():
+    """Clear only rates caches — leave jobs/clients untouched."""
     _cached_custom_rates.clear()
     _cached_additional_rates.clear()
 
@@ -1420,7 +1442,7 @@ with tab_master:
         _mr, _mu, _mn = _df_to_rate_dicts(sorted_df)
         try:
             db_sheets.save_custom_rates(_mr, _mu, _mn)
-            _clear_cloud_cache()
+            _clear_rates_cache()
             st.session_state.master_rates_df = sorted_df
             st.session_state.item_rates_df = sorted_df.copy()
             st.session_state.ITEM_RATES = _mr
@@ -1437,7 +1459,7 @@ with tab_master:
         _mr, _mu, _mn = _df_to_rate_dicts(pd.DataFrame(DEFAULT_MASTER_RATES))
         try:
             db_sheets.save_custom_rates(_mr, _mu, _mn)
-            _clear_cloud_cache()
+            _clear_rates_cache()
             st.session_state.master_rates_df = _prepare_master_rates_df(pd.DataFrame(DEFAULT_MASTER_RATES))
             st.session_state.item_rates_df = st.session_state.master_rates_df.copy()
             _update_session_rates_from_df(st.session_state.master_rates_df)
@@ -1483,7 +1505,7 @@ with tab_master:
         sorted_additional_df = _prepare_master_additional_rates_df(edited_additional_df)
         try:
             db_sheets.save_custom_additional_rates(_additional_rates_df_to_db_rows(sorted_additional_df))
-            _clear_cloud_cache()
+            _clear_rates_cache()
             st.session_state.master_additional_rates_df = sorted_additional_df
             _update_session_additional_rates_from_df(sorted_additional_df)
             st.session_state.rates_version += 1
@@ -1499,7 +1521,7 @@ with tab_master:
         )
         try:
             db_sheets.save_custom_additional_rates(_additional_rates_df_to_db_rows(default_additional_df))
-            _clear_cloud_cache()
+            _clear_rates_cache()
             st.session_state.master_additional_rates_df = default_additional_df
             _update_session_additional_rates_from_df(default_additional_df)
             st.session_state.rates_version += 1
@@ -1657,7 +1679,7 @@ with tab_quote:
         item_options = ["Walls"]
 
     for i, section in enumerate(st.session_state.paint_sections):
-        with st.expander(f"Section {i+1}", expanded=True):
+        with st.expander(f"Section {i+1}", expanded=(i == 0)):
             cols = st.columns(2)
             with cols[0]:
                 section["paint_class"] = st.selectbox(
@@ -1954,7 +1976,7 @@ Pro Paint Teams"""
                 db_sheets.save_job(job_no=job_no, job_name=client, client=client,
                                    area_manager=area_manager, team_leader="", start_date=quote_date,
                                    total_labour=total_labour, man_days_available=0)
-                _clear_cloud_cache()
+                _clear_jobs_cache()
                 st.success(f"✅ Quote **{job_no}** saved!")
             except Exception as e:
                 st.error(f"Save failed — {_sheets_error_msg(e)}")
@@ -2222,6 +2244,11 @@ with tab3:
 
     @st.fragment
     def _attendance_table_fragment():
+        # Keep mdr_rate and totals inside the fragment so they only recompute
+        # when attendance data or the rate actually changes — not on every
+        # unrelated widget interaction on the page.
+        _mdr = st.number_input("MDR Rate (R/day)", value=350.0, step=10.0, key="t3_mdr_rate")
+
         edited_df = st.data_editor(
             st.session_state.attendance_df,
             num_rows="fixed",
@@ -2239,33 +2266,34 @@ with tab3:
                 ) for day in day_cols},
                 "Totals": st.column_config.NumberColumn("Totals", disabled=True, width="small"),
                 "R/value": st.column_config.NumberColumn(
-                    "R/value", 
-                    disabled=True, 
-                    format="R %.2f", 
+                    "R/value",
+                    disabled=True,
+                    format="R %.2f",
                     width="small"
                 ),
             },
             key="attendance_editor"
         )
-        return edited_df
 
-    edited_df = _attendance_table_fragment()
-    st.session_state.attendance_df = edited_df
+        # Compute totals and R/value using vectorised ops — avoid per-row Python loop
+        df = edited_df.copy()
+        day_numeric = df[day_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+        row_totals = day_numeric.sum(axis=1).round(1)
+        df["Totals"] = row_totals
+        df["R/value"] = (row_totals * _mdr).round(2)
+        _total_used = float(row_totals.sum())
 
-    # Calculate Totals + R/value for each row
-    mdr_rate = st.number_input("MDR Rate (R/day)", value=350.0, step=10.0, key="t3_mdr_rate")
+        st.session_state.attendance_df = df
+        st.session_state["t3_total_man_days_used"] = _total_used
+        st.session_state["t3_mdr_rate_value"] = _mdr
 
-    total_man_days_used = 0.0
-    for i in range(len(st.session_state.attendance_df)):
-        numeric_day_values = pd.to_numeric(
-            st.session_state.attendance_df.iloc[i][day_cols], errors="coerce"
-        ).fillna(0)
-        row_total = numeric_day_values.sum()
-        st.session_state.attendance_df.at[i, "Totals"] = round(row_total, 1)
-        st.session_state.attendance_df.at[i, "R/value"] = round(row_total * mdr_rate, 2)
-        total_man_days_used += row_total
+        st.metric("**Man Days Total**", f"{_total_used:.2f}")
 
-    st.metric("**Man Days Total**", f"{total_man_days_used:.2f}")
+    _attendance_table_fragment()
+
+    # Read computed values written by the fragment above
+    total_man_days_used = float(st.session_state.get("t3_total_man_days_used", 0.0))
+    mdr_rate = float(st.session_state.get("t3_mdr_rate_value", 350.0))
 
     # ========== UPDATED BOTTOM SUMMARY BLOCK ==========
     st.markdown("### Summary & Bonus Calculation")
@@ -2464,33 +2492,34 @@ with tab5:
             fig_qty.update_layout(xaxis_tickangle=-45, showlegend=False)
             st.plotly_chart(fig_qty, width="stretch", key="dash_qty_chart")
 
-        dash_rows = [["Quote Area", "Quantity", "Allowed Man-Days"]]
-        for _, r in df_spec_dash.iterrows():
-            dash_rows.append([str(r.get("Quote Area", "")), f"{r.get('Quantity', 0):.1f}", f"{r.get('Allowed Man-Days', 0):.2f}"])
-        content_lines = [
-            f"Materials: R{data.get('total_material', 0):,.2f}",
-            f"Labour: R{data.get('total_labour', 0):,.2f}",
-            f"Grand Total: R{data.get('grand_total', 0):,.2f}",
-            f"Man-days Available: {float(data.get('man_days_available', 0)):.2f}"
-        ]
-        pdf_buffer = generate_letterhead_pdf(
-            "Job Dashboard Summary",
-            data.get("job_no", ""),
-            data.get("client", ""),
-            content_lines,
-            table_rows=dash_rows
-        )
-        if pdf_buffer:
-            st.download_button(
-                "📄 Download Dashboard Summary PDF",
-                data=pdf_buffer.getvalue(),
-                file_name=_download_filename(
-                    data.get("job_no", ""), data.get("client", ""), "pdf", extra_suffix="Dashboard"
-                ),
-                mime="application/pdf",
-                width="stretch",
-                type="primary"
+        if st.button("📄 Download Dashboard Summary PDF", type="primary", width="stretch",
+                     key="dash_pdf_btn"):
+            dash_rows = [["Quote Area", "Quantity", "Allowed Man-Days"]]
+            for _, r in df_spec_dash.iterrows():
+                dash_rows.append([str(r.get("Quote Area", "")), f"{r.get('Quantity', 0):.1f}", f"{r.get('Allowed Man-Days', 0):.2f}"])
+            content_lines = [
+                f"Materials: R{data.get('total_material', 0):,.2f}",
+                f"Labour: R{data.get('total_labour', 0):,.2f}",
+                f"Grand Total: R{data.get('grand_total', 0):,.2f}",
+                f"Man-days Available: {float(data.get('man_days_available', 0)):.2f}"
+            ]
+            pdf_buffer = generate_letterhead_pdf(
+                "Job Dashboard Summary",
+                data.get("job_no", ""),
+                data.get("client", ""),
+                content_lines,
+                table_rows=dash_rows
             )
+            if pdf_buffer:
+                st.download_button(
+                    "✅ Download Dashboard Summary PDF",
+                    data=pdf_buffer.getvalue(),
+                    file_name=_download_filename(
+                        data.get("job_no", ""), data.get("client", ""), "pdf", extra_suffix="Dashboard"
+                    ),
+                    mime="application/pdf",
+                    width="stretch",
+                )
 
 # ====================== TAB 6: QUOTES ======================
 with tab6:
