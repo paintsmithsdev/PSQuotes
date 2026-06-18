@@ -1984,30 +1984,32 @@ Pro Paint Teams"""
                 except Exception as e:
                     st.error(f"Save failed — {_sheets_error_msg(e)}")
 
-    # Data bridge for other tabs
+    # Data bridge for other tabs — scalar writes are cheap, always update
     st.session_state.total_material = total_material
     st.session_state.total_labour = total_labour
     st.session_state.additional_total = add_total
     st.session_state.grand_total = grand_total
     st.session_state.man_days_available = total_labour / 350 if total_labour > 0 else 0.0
-    st.session_state.paint_sections_for_tab2 = st.session_state.paint_sections.copy()
-    if "tab1_data" not in st.session_state:
-        st.session_state.tab1_data = {}
+    # Only do the expensive deep-copies and tab1_data rebuild when something actually changed
     _snap = _tab1_snapshot_id(
         st.session_state.paint_sections,
         st.session_state.additional_sections,
         job_no, client, total_material, total_labour, add_total,
     )
-    st.session_state.tab1_data.update({
-        "job_no": job_no, "client": client, "client_phone": client_phone, "client_email": client_email,
-        "client_address": client_address, "area_manager": area_manager, "am_phone": am_phone, "am_email": am_email,
-        "quote_date": quote_date, "total_material": total_material, "total_labour": total_labour,
-        "additional_total": add_total, "grand_total": grand_total,
-        "man_days_available": total_labour / 350 if total_labour > 0 else 0.0,
-        "paint_sections": st.session_state.paint_sections.copy(),
-        "additional_sections": st.session_state.additional_sections.copy(),
-        "snapshot_id": _snap,
-    })
+    if st.session_state.get("tab1_data", {}).get("snapshot_id") != _snap:
+        st.session_state.paint_sections_for_tab2 = st.session_state.paint_sections.copy()
+        if "tab1_data" not in st.session_state:
+            st.session_state.tab1_data = {}
+        st.session_state.tab1_data.update({
+            "job_no": job_no, "client": client, "client_phone": client_phone, "client_email": client_email,
+            "client_address": client_address, "area_manager": area_manager, "am_phone": am_phone, "am_email": am_email,
+            "quote_date": quote_date, "total_material": total_material, "total_labour": total_labour,
+            "additional_total": add_total, "grand_total": grand_total,
+            "man_days_available": total_labour / 350 if total_labour > 0 else 0.0,
+            "paint_sections": st.session_state.paint_sections.copy(),
+            "additional_sections": st.session_state.additional_sections.copy(),
+            "snapshot_id": _snap,
+        })
 
 # ====================== TAB 2: JOB SPEC & SITE MAN-DAYS ======================
 with tab2:
@@ -2431,12 +2433,20 @@ Signed (Manager):  ____________________________  Date: ____________
     st.text_area("Contract Preview", contract_text, height=400, disabled=True)
 
     contract_lines = [line.strip() for line in contract_text.strip().split("\n") if line.strip()]
-    pdf_buffer = generate_letterhead_pdf(
-        "Employment Contract",
-        data.get("job_no", ""),
-        data.get("client", ""),
-        content_lines=contract_lines
-    )
+    _tab4_pdf_key = hashlib.md5(
+        f"{data.get('job_no', '')}|{data.get('client', '')}|{contract_text}".encode("utf-8", errors="ignore")
+    ).hexdigest()
+    if st.session_state.get("_tab4_pdf_hash") != _tab4_pdf_key:
+        pdf_buffer = generate_letterhead_pdf(
+            "Employment Contract",
+            data.get("job_no", ""),
+            data.get("client", ""),
+            content_lines=contract_lines
+        )
+        st.session_state["_tab4_pdf_buffer"] = pdf_buffer
+        st.session_state["_tab4_pdf_hash"] = _tab4_pdf_key
+    else:
+        pdf_buffer = st.session_state.get("_tab4_pdf_buffer")
     if pdf_buffer:
         st.download_button(
             "📄 Download Employment Contract PDF",
@@ -2775,7 +2785,10 @@ with tab6:
 
                 quote_no = str(row.get("Quote #", "") or "")
                 if quote_no:
-                    _tab6_token = _create_auth_token(quote_no)
+                    _tab6_token_cache = st.session_state.setdefault("_tab6_token_cache", {})
+                    if quote_no not in _tab6_token_cache:
+                        _tab6_token_cache[quote_no] = _create_auth_token(quote_no)
+                    _tab6_token = _tab6_token_cache[quote_no]
                     _tab6_url = f"?auth_token={_url_quote(_tab6_token, safe='')}"
                     row_cols[7].markdown(
                         f'<a href="{_tab6_url}" target="_blank" rel="noopener noreferrer"'
